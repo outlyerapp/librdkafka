@@ -598,7 +598,8 @@ static void do_test_options (rd_kafka_t *rk) {
                 const char **for_api;
 
                 for (for_api = all_apis ; ; for_api++) {
-                        rd_kafka_resp_err_t err, exp_err;
+                        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR,
+                                exp_err;
                         char errstr[512];
                         int fi;
 
