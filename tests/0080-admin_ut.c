@@ -38,6 +38,31 @@
 
 
 
+static mtx_t last_event_lock;
+static cnd_t last_event_cnd;
+static rd_kafka_event_t *last_event = NULL;
+
+static void event_cb (rd_kafka_t *rk, rd_kafka_event_t *rkev, void *opaque) {
+        mtx_lock(&last_event_lock);
+        TEST_ASSERT(!last_event, "Multiple events seen in event_cb "
+                    "(existing %s, new %s)",
+                    rd_kafka_event_name(last_event), rd_kafka_event_name(rkev));
+        last_event = rkev;
+        mtx_unlock(&last_event_lock);
+        cnd_broadcast(&last_event_cnd);
+        rd_sleep(1);
+}
+
+static rd_kafka_event_t *wait_event_cb (void) {
+        rd_kafka_event_t *rkev;
+        mtx_lock(&last_event_lock);
+        while (!(rkev = last_event))
+                cnd_wait(&last_event_cnd, &last_event_lock);
+        last_event = NULL;
+        mtx_unlock(&last_event_lock);
+
+        return rkev;
+}
 
 
 /**
@@ -48,7 +73,7 @@
  */
 static void do_test_CreateTopics (const char *what,
                                   rd_kafka_t *rk, rd_kafka_queue_t *useq,
-                                  int with_options) {
+                                  int with_event_cb, int with_options) {
         rd_kafka_queue_t *q = useq ? useq : rd_kafka_queue_new(rk);
 #define MY_NEW_TOPICS_CNT 6
         rd_kafka_NewTopic_t *new_topics[MY_NEW_TOPICS_CNT];
@@ -184,13 +209,23 @@ static void do_test_CreateTopics (const char *what,
                               options, q);
         TIMING_ASSERT_LATER(&timing, 0, 50);
 
-        /* Poll result queue */
-        TIMING_START(&timing, "CreateTopics.queue_poll");
-        rkev = rd_kafka_queue_poll(q, exp_timeout + 1000);
+        if (with_event_cb) {
+                /* Result event will be triggered by callback from
+                 * internal librdkafka main thread. */
+                TIMING_START(&timing, "CreateTopics.wait_event_cb");
+                rkev = wait_event_cb();
+        } else {
+                /* Poll result queue */
+                TIMING_START(&timing, "CreateTopics.queue_poll");
+                rkev = rd_kafka_queue_poll(q, exp_timeout + 1000);
+        }
+
         TIMING_ASSERT_LATER(&timing, exp_timeout-100, exp_timeout+100);
-        TEST_ASSERT(rkev != NULL, "expected result in %dms", exp_timeout);
+        TEST_ASSERT(rkev != NULL, "expected result in %dms",
+                    exp_timeout);
         TEST_SAY("CreateTopics: got %s in %.3fs\n",
-                 rd_kafka_event_name(rkev), TIMING_DURATION(&timing) / 1000.0f);
+                 rd_kafka_event_name(rkev),
+                 TIMING_DURATION(&timing) / 1000.0f);
 
         /* Convert event to proper result */
         res = rd_kafka_event_CreateTopics_result(rkev);
@@ -656,8 +691,11 @@ static void do_test_options (rd_kafka_t *rk) {
 static void do_test_apis (rd_kafka_type_t cltype) {
         rd_kafka_t *rk;
         char errstr[512];
-        rd_kafka_queue_t *mainq;
+        rd_kafka_queue_t *mainq, *internalq;
         rd_kafka_conf_t *conf;
+
+        mtx_init(&last_event_lock, mtx_plain);
+        cnd_init(&last_event_cnd);
 
         do_test_unclean_destroy(cltype, 0/*tempq*/);
         do_test_unclean_destroy(cltype, 1/*mainq*/);
@@ -667,17 +705,21 @@ static void do_test_apis (rd_kafka_type_t cltype) {
          * rely on the controller not being found. */
         test_conf_set(conf, "bootstrap.servers", "");
         test_conf_set(conf, "socket.timeout.ms", MY_SOCKET_TIMEOUT_MS_STR);
+        /* For use with internalq */
+        rd_kafka_conf_set_event_cb(conf, event_cb);
 
         rk = rd_kafka_new(cltype, conf, errstr, sizeof(errstr));
         TEST_ASSERT(rk, "kafka_new(%d): %s", cltype, errstr);
 
         mainq = rd_kafka_queue_get_main(rk);
+        internalq = rd_kafka_queue_get_internal(rk);
 
         do_test_options(rk);
 
-        do_test_CreateTopics("temp queue, no options", rk, NULL, 0);
-        do_test_CreateTopics("temp queue, options", rk, NULL, 1);
-        do_test_CreateTopics("main queue, options", rk, mainq, 1);
+        do_test_CreateTopics("temp queue, no options", rk, NULL, 0, 0);
+        do_test_CreateTopics("temp queue, no options, event_cb", rk, internalq, 1, 0);
+        do_test_CreateTopics("temp queue, options", rk, NULL, 0, 1);
+        do_test_CreateTopics("main queue, options", rk, mainq, 0, 1);
 
         do_test_DeleteTopics("temp queue, no options", rk, NULL, 0);
         do_test_DeleteTopics("temp queue, options", rk, NULL, 1);
@@ -687,9 +729,14 @@ static void do_test_apis (rd_kafka_type_t cltype) {
 
         do_test_configs(rk, mainq);
 
+        rd_kafka_queue_destroy(internalq);
         rd_kafka_queue_destroy(mainq);
 
         rd_kafka_destroy(rk);
+
+        mtx_destroy(&last_event_lock);
+        cnd_destroy(&last_event_cnd);
+
 }
 
 

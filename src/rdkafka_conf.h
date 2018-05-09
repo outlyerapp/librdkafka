@@ -321,6 +321,10 @@ struct rd_kafka_conf_s {
         int (*open_cb) (const char *pathname, int flags, mode_t mode,
                         void *opaque);
 
+        /* Event callback */
+        void (*event_cb) (rd_kafka_t *rk, rd_kafka_event_t *rkev, void *opaque);
+
+
 	/* Opaque passed to callbacks. */
 	void  *opaque;
 

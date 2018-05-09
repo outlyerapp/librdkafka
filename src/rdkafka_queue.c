@@ -667,6 +667,11 @@ rd_kafka_queue_t *rd_kafka_queue_get_partition (rd_kafka_t *rk,
         return result;
 }
 
+rd_kafka_queue_t *rd_kafka_queue_get_internal (rd_kafka_t *rk) {
+        return rd_kafka_queue_new0(rk, rk->rk_ops);
+}
+
+
 rd_kafka_resp_err_t rd_kafka_set_log_queue (rd_kafka_t *rk,
                                             rd_kafka_queue_t *rkqu) {
         rd_kafka_q_t *rkq;

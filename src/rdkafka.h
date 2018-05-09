@@ -233,6 +233,7 @@ typedef struct rd_kafka_topic_s rd_kafka_topic_t;
 typedef struct rd_kafka_conf_s rd_kafka_conf_t;
 typedef struct rd_kafka_topic_conf_s rd_kafka_topic_conf_t;
 typedef struct rd_kafka_queue_s rd_kafka_queue_t;
+typedef struct rd_kafka_op_s rd_kafka_event_t;
 typedef struct rd_kafka_topic_result_s rd_kafka_topic_result_t;
 /* @endcond */
 
@@ -1318,6 +1319,39 @@ void rd_kafka_conf_set_events(rd_kafka_conf_t *conf, int events);
 
 
 /**
+ * @brief Generic event callback to be used with the event API to trigger
+ *        callbacks for \c rd_kafka_event_t objects from the internal
+ *        librdkafka main thread.
+ *
+ * First set the event callback with this function, followed by creating an
+ * rd_kafka_t instance with rd_kafka_new().
+ * Get the instance's internal queue with rd_kafka_queue_get_internal() and
+ * pass it as the reply/response queue to an API that takes an event queue,
+ * such as rd_kafka_CreateTopics().
+ * As the response event is ready the event callback will be triggered
+ * from the internal librdkafka main thread.
+ * The application must destroyed the \c rkev passed to \p event cb using
+ * rd_kafka_event_destroy().
+ *
+ * The \p event_cb \c opaque argument is the opaque set with
+ * rd_kafka_conf_set_opaque().
+ *
+ * @remark This callback is a specialized alternative to the poll-based
+ *         event API described in the Event interface section.
+ *
+ * @remark The \p event_cb will be called spontaneously from librdkafka's
+ *         internal threads.
+ *         An application MUST NOT do any prolonged work in its \p event_cb.
+ *
+ * @sa rd_kafka_queue_get_internal
+ */
+RD_EXPORT
+void rd_kafka_conf_set_event_cb (rd_kafka_conf_t *conf,
+                                 void (*event_cb) (rd_kafka_t *rk,
+                                                   rd_kafka_event_t *rkev,
+                                                   void *opaque));
+
+/**
  @deprecated See rd_kafka_conf_set_dr_msg_cb()
 */
 RD_EXPORT
@@ -2337,6 +2371,22 @@ RD_EXPORT
 rd_kafka_queue_t *rd_kafka_queue_get_partition (rd_kafka_t *rk,
                                                 const char *topic,
                                                 int32_t partition);
+
+/**
+ * @returns a reference to librdkafka's internal main queue.
+ *
+ * This queue MUST NOT be polled by the application, but can instead be
+ * used as a callback-trigger result/reply queue for various operations.
+ *
+ * The generic event callback MUST be set with rd_kafka_conf_set_event_cb().
+ *
+ * The callback will be triggered from an internal librdkafka thread.
+ *
+ * Use rd_kafka_queue_destroy() to loose the reference.
+ */
+RD_EXPORT
+rd_kafka_queue_t *rd_kafka_queue_get_internal (rd_kafka_t *rk);
+
 
 /**
  * @brief Forward/re-route queue \p src to \p dst.
@@ -3496,9 +3546,6 @@ typedef int rd_kafka_event_type_t;
 #define RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT 104 /**< DescribeConfigs_result_t */
 
 
-typedef struct rd_kafka_op_s rd_kafka_event_t;
-
-
 /**
  * @returns the event type for the given event.
  *
@@ -3738,6 +3785,8 @@ rd_kafka_event_DescribeConfigs_result (rd_kafka_event_t *rkev);
  * @returns an event, or NULL.
  *
  * @remark Use rd_kafka_event_destroy() to free the event.
+ *
+ * @sa rd_kafka_conf_set_event_cb()
  */
 RD_EXPORT
 rd_kafka_event_t *rd_kafka_queue_poll (rd_kafka_queue_t *rkqu, int timeout_ms);

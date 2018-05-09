@@ -2595,6 +2595,28 @@ rd_kafka_offsets_for_times (rd_kafka_t *rk,
 
 
 /**
+ * @brief Call the registered event_cb.
+ * @locality rdkafka main thread
+ */
+static void rd_kafka_call_event_cb (rd_kafka_t *rk, rd_kafka_op_t *rko) {
+        const rd_ts_t thres = 500 * 1000; /* 500ms */
+        rd_ts_t ts = rd_clock();
+
+        rk->rk_conf.event_cb(rk, rko, rk->rk_conf.opaque);
+
+        /* Measure time spent in callback and warn if too long. */
+        ts = rd_clock() - ts;
+        if (unlikely(ts > thres))
+                rd_kafka_log(rk, LOG_WARNING, "EVENTCB",
+                             "Application spent too much time "
+                             "(%dms > %dms threshold) "
+                             "in event_cb for %s event",
+                             (int)(ts / 1000), (int)(thres / 1000),
+                             rd_kafka_event_name(rko));
+}
+
+
+/**
  * rd_kafka_poll() (and similar) op callback handler.
  * Will either call registered callback depending on cb_type and op type
  * or return op to application, if applicable (e.g., fetch message).
@@ -2609,10 +2631,21 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
 	rd_kafka_msg_t *rkm;
         rd_kafka_op_res_t res = RD_KAFKA_OP_RES_HANDLED;
 
-	/* Return-as-event requested, see if op can be converted to event,
-	 * otherwise fall through and trigger callbacks. */
-	if (cb_type == RD_KAFKA_Q_CB_EVENT && rd_kafka_event_setup(rk, rko))
-                return RD_KAFKA_OP_RES_PASS; /* Return as event */
+        /* Special handling for events based on cb_type */
+        if (cb_type == RD_KAFKA_Q_CB_EVENT) {
+                if (rd_kafka_event_setup(rk, rko)) {
+                        /* Return-as-event requested. */
+                        return RD_KAFKA_OP_RES_PASS; /* Return as event */
+                }
+        } else if (cb_type == RD_KAFKA_Q_CB_CALLBACK && rk->rk_conf.event_cb) {
+                if (rd_kafka_event_setup(rk, rko)) {
+                        /* Trigger callbacks requested and a generic
+                         * event_cb has been configured. */
+                        rd_kafka_call_event_cb(rk, rko);
+                        /* Event must be destroyed by application. */
+                        return RD_KAFKA_OP_RES_HANDLED;
+                }
+        }
 
         switch ((int)rko->rko_type)
         {
