@@ -13,7 +13,7 @@ build:
     - docker-build
   script:
     - docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} docker.dataloop.io
-    - docker build -t docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
+    - docker build -t docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER} .
     - docker push docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
   only: 
     - outlyer
