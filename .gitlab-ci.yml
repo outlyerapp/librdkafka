@@ -1,0 +1,23 @@
+---
+
+before_script:
+    - export BUILD_NUMBER=$(git describe --tags)
+    - echo ${BUILD_NUMBER}
+
+stages:
+  - build
+  - package
+  - repo
+
+build:
+  stage: build
+  tags:
+    - docker-build
+  script:
+    - docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} docker.dataloop.io
+    - docker build -t docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
+    - docker push docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
+  only: 
+    - outlyer
+  when:
+    - tags
