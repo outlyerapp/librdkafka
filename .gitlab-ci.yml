@@ -18,6 +18,4 @@ build:
     - docker build -t docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
     - docker push docker.dataloop.io/outlyerapp/librdkafka/golang1-10:${BUILD_NUMBER}
   only: 
-    - outlyer
-  when:
     - tags
