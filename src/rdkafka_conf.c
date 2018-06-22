@@ -120,6 +120,19 @@ rd_kafka_conf_validate_single (const struct rd_kafka_property *prop,
 	return !strchr(val, ',') && !strchr(val, ' ');
 }
 
+/**
+ * @brief Validate builtin partitioner string
+ */
+static RD_UNUSED int
+rd_kafka_conf_validate_partitioner (const struct rd_kafka_property *prop,
+                                    const char *val, int ival) {
+        return !strcmp(val, "random") ||
+                !strcmp(val, "consistent") ||
+                !strcmp(val, "consistent_random") ||
+                !strcmp(val, "murmur2") ||
+                !strcmp(val, "murmur2_random");
+}
+
 
 /**
  * librdkafka configuration property definitions.
@@ -178,12 +191,12 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  0, 1000000000, 0xffff },
 	{ _RK_GLOBAL, "receive.message.max.bytes", _RK_C_INT,
           _RK(recv_max_msg_size),
-	  "Maximum Kafka protocol response message size. "
-	  "This is a safety precaution to avoid memory exhaustion in case of "
-	  "protocol hickups. "
-          "The value should be at least fetch.message.max.bytes * number of "
-          "partitions consumed from + messaging overhead (e.g. 200000 bytes).",
-	  1000, 1000000000, 100000000 },
+          "Maximum Kafka protocol response message size. "
+          "This serves as a safety precaution to avoid memory exhaustion in "
+          "case of protocol hickups. "
+          "This value is automatically adjusted upwards to be at least "
+          "`fetch.max.bytes` + 512 to allow for protocol overhead.",
+	  1000, INT_MAX, 100000000 },
 	{ _RK_GLOBAL, "max.in.flight.requests.per.connection", _RK_C_INT,
 	  _RK(max_inflight),
 	  "Maximum number of in-flight requests per broker connection. "
@@ -232,25 +245,32 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "broker metadata information as if the topics did not exist." },
 	{ _RK_GLOBAL, "debug", _RK_C_S2F, _RK(debug),
 	  "A comma-separated list of debug contexts to enable. "
-	  "Debugging the Producer: broker,topic,msg. Consumer: cgrp,topic,fetch",
+          "Detailed Producer debugging: broker,topic,msg. "
+          "Consumer: consumer,cgrp,topic,fetch",
 	  .s2i = {
                         { RD_KAFKA_DBG_GENERIC,  "generic" },
 			{ RD_KAFKA_DBG_BROKER,   "broker" },
 			{ RD_KAFKA_DBG_TOPIC,    "topic" },
 			{ RD_KAFKA_DBG_METADATA, "metadata" },
+                        { RD_KAFKA_DBG_FEATURE,  "feature" },
 			{ RD_KAFKA_DBG_QUEUE,    "queue" },
 			{ RD_KAFKA_DBG_MSG,      "msg" },
 			{ RD_KAFKA_DBG_PROTOCOL, "protocol" },
                         { RD_KAFKA_DBG_CGRP,     "cgrp" },
 			{ RD_KAFKA_DBG_SECURITY, "security" },
 			{ RD_KAFKA_DBG_FETCH,    "fetch" },
-			{ RD_KAFKA_DBG_FEATURE,  "feature" },
                         { RD_KAFKA_DBG_INTERCEPTOR, "interceptor" },
                         { RD_KAFKA_DBG_PLUGIN,   "plugin" },
-			{ RD_KAFKA_DBG_ALL,      "all" },
+                        { RD_KAFKA_DBG_CONSUMER, "consumer" },
+			{ RD_KAFKA_DBG_ALL,      "all" }
 		} },
 	{ _RK_GLOBAL, "socket.timeout.ms", _RK_C_INT, _RK(socket_timeout_ms),
-	  "Timeout for network requests.",
+	  "Default timeout for network requests. "
+          "Producer: ProduceRequests will use the lesser value of "
+          "socket.timeout.ms and remaining message.timeout.ms for the "
+          "first message in the batch. "
+          "Consumer: FetchRequests will use "
+          "fetch.wait.max.ms + socket.timeout.ms. ",
 	  10, 300*1000, 60*1000 },
 	{ _RK_GLOBAL, "socket.blocking.max.ms", _RK_C_INT,
 	  _RK(socket_blocking_max_ms),
@@ -279,7 +299,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "Disconnect from broker when this number of send failures "
           "(e.g., timed out requests) is reached. Disable with 0. "
           "NOTE: The connection is automatically re-established.",
-          0, 1000000, 3 },
+          0, 1000000, 1 },
 	{ _RK_GLOBAL, "broker.address.ttl", _RK_C_INT,
 	  _RK(broker_addr_ttl),
 	  "How long to cache the broker address resolving "
@@ -471,16 +491,18 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(ssl.crl_location),
 	  "Path to CRL for verifying broker's certificate validity."
 	},
+	{ _RK_GLOBAL, "ssl.keystore.location", _RK_C_STR,
+	_RK(ssl.keystore_location),
+	"Path to client's keystore (PKCS#12) used for authentication."
+	},
+	{ _RK_GLOBAL, "ssl.keystore.password", _RK_C_STR,
+	_RK(ssl.keystore_password),
+	"Client's keystore (PKCS#12) password."
+	},
 #endif /* WITH_SSL */
 
         /* Point user in the right direction if they try to apply
          * Java client SSL / JAAS properties. */
-        { _RK_GLOBAL, "ssl.keystore.location", _RK_C_INVALID,
-          _RK(dummy),
-          "Java KeyStores are not supported, use `ssl.key.location` and "
-          "a private key (PEM) file instead. "
-          "See https://github.com/edenhill/librdkafka/wiki/Using-SSL-with-librdkafka for more information."
-        },
         { _RK_GLOBAL, "ssl.truststore.location", _RK_C_INVALID,
           _RK(dummy),
           "Java TrustStores are not supported, use `ssl.ca.location` "
@@ -501,13 +523,17 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	 "**NOTE**: Despite the name only one mechanism must be configured.",
 	 .sdef = "GSSAPI",
 	 .validate = rd_kafka_conf_validate_single },
+        {_RK_GLOBAL,"sasl.mechanism", _RK_C_ALIAS,
+         .sdef = "sasl.mechanisms" },
 	{ _RK_GLOBAL, "sasl.kerberos.service.name", _RK_C_STR,
 	  _RK(sasl.service_name),
-	  "Kerberos principal name that Kafka runs as.",
+	  "Kerberos principal name that Kafka runs as, "
+          "not including /hostname@REALM",
 	  .sdef = "kafka" },
 	{ _RK_GLOBAL, "sasl.kerberos.principal", _RK_C_STR,
 	  _RK(sasl.principal),
-	  "This client's Kerberos principal name.",
+          "This client's Kerberos principal name. "
+          "(Not supported on Windows, will use the logon user's principal).",
 	  .sdef = "kafkaclient" },
 #ifndef _MSC_VER
 	{ _RK_GLOBAL, "sasl.kerberos.kinit.cmd", _RK_C_STR,
@@ -591,7 +617,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
         /* Global consumer properties */
         { _RK_GLOBAL|_RK_CONSUMER, "enable.auto.commit", _RK_C_BOOL,
           _RK(enable_auto_commit),
-          "Automatically and periodically commit offsets in the background.",
+          "Automatically and periodically commit offsets in the background. "
+          "Note: setting this to false does not prevent the consumer from "
+          "fetching previously committed start offsets. To circumvent this "
+          "behaviour set specific start offsets per partition in the call "
+          "to assign().",
           0, 1, 1 },
         { _RK_GLOBAL|_RK_CONSUMER, "auto.commit.interval.ms", _RK_C_INT,
 	  _RK(auto_commit_interval_ms),
@@ -615,7 +645,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "local consumer queue. "
 	  "This value may be overshot by fetch.message.max.bytes. "
 	  "This property has higher priority than queued.min.messages.",
-          1, 1000000000, 1000000 /* 1 Gig */ },
+          1, INT_MAX/1024, 0x100000/*1GB*/ },
 	{ _RK_GLOBAL|_RK_CONSUMER, "fetch.wait.max.ms", _RK_C_INT,
 	  _RK(fetch_wait_max_ms),
 	  "Maximum time the broker may wait to fill the response "
@@ -631,6 +661,19 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           1, 1000000000, 1024*1024 },
 	{ _RK_GLOBAL|_RK_CONSUMER, "max.partition.fetch.bytes", _RK_C_ALIAS,
 	  .sdef = "fetch.message.max.bytes" },
+        { _RK_GLOBAL|_RK_CONSUMER, "fetch.max.bytes", _RK_C_INT,
+          _RK(fetch_max_bytes),
+          "Maximum amount of data the broker shall return for a Fetch request. "
+          "Messages are fetched in batches by the consumer and if the first "
+          "message batch in the first non-empty partition of the Fetch request "
+          "is larger than this value, then the message batch will still be "
+          "returned to ensure the consumer can make progress. "
+          "The maximum message batch size accepted by the broker is defined "
+          "via `message.max.bytes` (broker config) or "
+          "`max.message.bytes` (broker topic config). "
+          "`fetch.max.bytes` is automatically adjusted upwards to be "
+          "at least `message.max.bytes` (consumer config).",
+          0, INT_MAX-512, 50*1024*1024 /* 50MB */ },
 	{ _RK_GLOBAL|_RK_CONSUMER, "fetch.min.bytes", _RK_C_INT,
 	  _RK(fetch_min_bytes),
 	  "Minimum number of bytes the broker responds with. "
@@ -686,7 +729,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(queue_buffering_max_kbytes),
 	  "Maximum total message size sum allowed on the producer queue. "
 	  "This property has higher priority than queue.buffering.max.messages.",
-	  1, INT_MAX/1024, 4000000 },
+	  1, INT_MAX/1024, 0x100000/*1GB*/ },
 	{ _RK_GLOBAL|_RK_PRODUCER, "queue.buffering.max.ms", _RK_C_INT,
 	  _RK(buffering_max_ms),
 	  "Delay in milliseconds to wait for messages in the producer queue "
@@ -707,8 +750,16 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                 .sdef = "message.send.max.retries" },
 	{ _RK_GLOBAL|_RK_PRODUCER, "retry.backoff.ms", _RK_C_INT,
 	  _RK(retry_backoff_ms),
-	  "The backoff time in milliseconds before retrying a message send.",
+	  "The backoff time in milliseconds before retrying a protocol request.",
 	  1, 300*1000, 100 },
+
+        { _RK_GLOBAL|_RK_PRODUCER, "queue.buffering.backpressure.threshold",
+          _RK_C_INT, _RK(queue_backpressure_thres),
+          "The threshold of outstanding not yet transmitted requests "
+          "needed to backpressure the producer's message accumulator. "
+          "A lower number yields larger and more effective batches.",
+          0, 1000000, 10 },
+
 	{ _RK_GLOBAL|_RK_PRODUCER, "compression.codec", _RK_C_S2I,
 	  _RK(compression_codec),
 	  "compression codec to use for compressing message sets. "
@@ -726,6 +777,8 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                         { RD_KAFKA_COMPRESSION_LZ4, "lz4" },
 			{ 0 }
 		} },
+        { _RK_GLOBAL|_RK_PRODUCER, "compression.type", _RK_C_ALIAS,
+          .sdef = "compression.codec" },
 	{ _RK_GLOBAL|_RK_PRODUCER, "batch.num.messages", _RK_C_INT,
 	  _RK(batch_num_messages),
 	  "Maximum number of messages batched in one MessageSet. "
@@ -755,7 +808,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "*0*=Broker does not send any response/ack to client, "
 	  "*1*=Only the leader broker will need to ack the message, "
 	  "*-1* or *all*=broker will block until message is committed by all "
-	  "in sync replicas (ISRs) or broker's `in.sync.replicas` "
+	  "in sync replicas (ISRs) or broker's `min.insync.replicas` "
 	  "setting before sending response. ",
 	  -1, 1000, 1,
 	  .s2i = {
@@ -778,22 +831,49 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "produced message waits for successful delivery. "
           "A time of 0 is infinite.",
 	  0, 900*1000, 300*1000 },
+        { _RK_TOPIC|_RK_PRODUCER, "queuing.strategy", _RK_C_S2I,
+          _RKT(queuing_strategy),
+          "Producer queuing strategy. FIFO preserves produce ordering, "
+          "while LIFO prioritizes new messages. "
+          "WARNING: `lifo` is experimental and subject to change or removal.",
+          .vdef = 0,
+          .s2i = {
+                        { RD_KAFKA_QUEUE_FIFO, "fifo" },
+                        { RD_KAFKA_QUEUE_LIFO, "lifo" }
+                }
+        },
         { _RK_TOPIC|_RK_PRODUCER, "produce.offset.report", _RK_C_BOOL,
           _RKT(produce_offset_report),
           "Report offset of produced message back to application. "
           "The application must be use the `dr_msg_cb` to retrieve the offset "
           "from `rd_kafka_message_t.offset`.",
           0, 1, 0 },
+        { _RK_TOPIC|_RK_PRODUCER, "partitioner", _RK_C_STR,
+          _RKT(partitioner_str),
+          "Partitioner: "
+          "`random` - random distribution, "
+          "`consistent` - CRC32 hash of key (Empty and NULL keys are mapped to single partition), "
+          "`consistent_random` - CRC32 hash of key (Empty and NULL keys are randomly partitioned), "
+          "`murmur2` - Java Producer compatible Murmur2 hash of key (NULL keys are mapped to single partition), "
+          "`murmur2_random` - Java Producer compatible Murmur2 hash of key (NULL keys are randomly partitioned. This is functionally equivalent to the default partitioner in the Java Producer.).",
+          .sdef = "consistent_random",
+          .validate = rd_kafka_conf_validate_partitioner },
 	{ _RK_TOPIC|_RK_PRODUCER, "partitioner_cb", _RK_C_PTR,
 	  _RKT(partitioner),
-	  "Partitioner callback "
+	  "Custom partitioner callback "
 	  "(set with rd_kafka_topic_conf_set_partitioner_cb())" },
+	{ _RK_TOPIC|_RK_PRODUCER, "msg_order_cmp", _RK_C_PTR,
+	  _RKT(msg_order_cmp),
+	  "Message queue ordering comparator "
+	  "(set with rd_kafka_topic_conf_set_msg_order_cmp()). "
+          "Also see `queuing.strategy`." },
 	{ _RK_TOPIC, "opaque", _RK_C_PTR,
 	  _RKT(opaque),
 	  "Application opaque (set with rd_kafka_topic_conf_set_opaque())" },
 	{ _RK_TOPIC | _RK_PRODUCER, "compression.codec", _RK_C_S2I,
 	  _RKT(compression_codec),
-	  "Compression codec to use for compressing message sets. ",
+	  "Compression codec to use for compressing message sets. "
+          "inherit = inherit global compression.codec configuration.",
 	  .vdef = RD_KAFKA_COMPRESSION_INHERIT,
 	  .s2i = {
 		  { RD_KAFKA_COMPRESSION_NONE, "none" },
@@ -807,6 +887,8 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 		  { RD_KAFKA_COMPRESSION_INHERIT, "inherit" },
 		  { 0 }
 		} },
+        { _RK_TOPIC | _RK_PRODUCER, "compression.type", _RK_C_ALIAS,
+          .sdef = "compression.codec" },
 
 
         /* Topic consumer properties */
@@ -1619,6 +1701,12 @@ rd_kafka_topic_conf_t *rd_kafka_topic_conf_dup (const rd_kafka_topic_conf_t
 	return new;
 }
 
+rd_kafka_topic_conf_t *rd_kafka_default_topic_conf_dup (rd_kafka_t *rk) {
+        if (rk->rk_conf.topic_conf)
+                return rd_kafka_topic_conf_dup(rk->rk_conf.topic_conf);
+        else
+                return rd_kafka_topic_conf_new();
+}
 
 void rd_kafka_conf_set_events (rd_kafka_conf_t *conf, int events) {
 	conf->enabled_events = events;
@@ -1763,6 +1851,15 @@ rd_kafka_topic_conf_set_partitioner_cb (rd_kafka_topic_conf_t *topic_conf,
 						void *rkt_opaque,
 						void *msg_opaque)) {
 	topic_conf->partitioner = partitioner;
+}
+
+void
+rd_kafka_topic_conf_set_msg_order_cmp (rd_kafka_topic_conf_t *topic_conf,
+                                       int (*msg_order_cmp) (
+                                               const rd_kafka_message_t *a,
+                                               const rd_kafka_message_t *b)) {
+        topic_conf->msg_order_cmp =
+                (int (*)(const void *, const void *))msg_order_cmp;
 }
 
 void rd_kafka_topic_conf_set_opaque (rd_kafka_topic_conf_t *topic_conf,

@@ -260,9 +260,52 @@ shptr_rd_kafka_itopic_t *rd_kafka_topic_new0 (rd_kafka_t *rk,
                         * just the placeholder. The internal members
                         * were copied on the line above. */
 
-	/* Default partitioner: consistent_random */
-	if (!rkt->rkt_conf.partitioner)
-		rkt->rkt_conf.partitioner = rd_kafka_msg_partitioner_consistent_random;
+        /* Partitioner */
+        if (!rkt->rkt_conf.partitioner) {
+                const struct {
+                        const char *str;
+                        void *part;
+                } part_map[] = {
+                        { "random",
+                          (void *)rd_kafka_msg_partitioner_random },
+                        { "consistent",
+                          (void *)rd_kafka_msg_partitioner_consistent },
+                        { "consistent_random",
+                          (void *)rd_kafka_msg_partitioner_consistent_random },
+                        { "murmur2",
+                          (void *)rd_kafka_msg_partitioner_murmur2 },
+                        { "murmur2_random",
+                          (void *)rd_kafka_msg_partitioner_murmur2_random },
+                        { NULL }
+                };
+                int i;
+
+                /* Use "partitioner" configuration property string, if set */
+                for (i = 0 ; rkt->rkt_conf.partitioner_str && part_map[i].str ;
+                     i++) {
+                        if (!strcmp(rkt->rkt_conf.partitioner_str,
+                                    part_map[i].str)) {
+                                rkt->rkt_conf.partitioner = part_map[i].part;
+                                break;
+                        }
+                }
+
+                /* Default partitioner: consistent_random */
+                if (!rkt->rkt_conf.partitioner) {
+                        /* Make sure part_map matched something, otherwise
+                         * there is a discreprency between this code
+                         * and the validator in rdkafka_conf.c */
+                        assert(!rkt->rkt_conf.partitioner_str);
+
+                        rkt->rkt_conf.partitioner =
+                                rd_kafka_msg_partitioner_consistent_random;
+                }
+        }
+
+        if (rkt->rkt_conf.queuing_strategy == RD_KAFKA_QUEUE_FIFO)
+                rkt->rkt_conf.msg_order_cmp = rd_kafka_msg_cmp_msgseq;
+        else
+                rkt->rkt_conf.msg_order_cmp = rd_kafka_msg_cmp_msgseq_lifo;
 
 	if (rkt->rkt_conf.compression_codec == RD_KAFKA_COMPRESSION_INHERIT)
 		rkt->rkt_conf.compression_codec = rk->rk_conf.compression_codec;
@@ -459,10 +502,8 @@ static int rd_kafka_topic_partition_cnt_update (rd_kafka_itopic_t *rkt,
 						int32_t partition_cnt) {
 	rd_kafka_t *rk = rkt->rkt_rk;
 	shptr_rd_kafka_toppar_t **rktps;
-	shptr_rd_kafka_toppar_t *rktp_ua;
         shptr_rd_kafka_toppar_t *s_rktp;
 	rd_kafka_toppar_t *rktp;
-	rd_kafka_msgq_t tmpq = RD_KAFKA_MSGQ_INITIALIZER(tmpq);
 	int32_t i;
 
 	if (likely(rkt->rkt_partition_cnt == partition_cnt))
@@ -517,8 +558,6 @@ static int rd_kafka_topic_partition_cnt_update (rd_kafka_itopic_t *rkt,
 		}
 	}
 
-	rktp_ua = rd_kafka_toppar_get(rkt, RD_KAFKA_PARTITION_UA, 0);
-
         /* Propagate notexist errors for desired partitions */
         RD_LIST_FOREACH(s_rktp, &rkt->rkt_desp, i) {
                 rd_kafka_dbg(rkt->rkt_rk, TOPIC, "DESIRED",
@@ -527,7 +566,10 @@ static int rd_kafka_topic_partition_cnt_update (rd_kafka_itopic_t *rkt,
                              rkt->rkt_topic->str,
                              rd_kafka_toppar_s2i(s_rktp)->rktp_partition);
                 rd_kafka_toppar_enq_error(rd_kafka_toppar_s2i(s_rktp),
-                                          RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION);
+                                          RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION,
+                                          "desired partition does not exist "
+                                          "in cluster");
+
         }
 
 	/* Remove excessive partitions */
@@ -559,7 +601,8 @@ static int rd_kafka_topic_partition_cnt_update (rd_kafka_itopic_t *rkt,
                         if (!rd_kafka_terminating(rkt->rkt_rk))
                                 rd_kafka_toppar_enq_error(
                                         rktp,
-                                        RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION);
+                                        RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION,
+                                        "desired partition no longer exists");
 
 			rd_kafka_toppar_broker_delegate(rktp, NULL, 0);
 
@@ -572,42 +615,6 @@ static int rd_kafka_topic_partition_cnt_update (rd_kafka_itopic_t *rkt,
 		rd_kafka_toppar_unlock(rktp);
 
 		rd_kafka_toppar_destroy(s_rktp);
-	}
-
-	if (likely(rktp_ua != NULL)) {
-		/* Move messages from removed partitions to UA for
-		 * further processing. */
-		rktp = rd_kafka_toppar_s2i(rktp_ua);
-
-		// FIXME: tmpq not used
-		if (rd_kafka_msgq_len(&tmpq) > 0) {
-			rd_kafka_dbg(rkt->rkt_rk, TOPIC, "TOPPARMOVE",
-				     "Moving %d messages (%zd bytes) from "
-				     "%d removed partitions to UA partition",
-				     rd_kafka_msgq_len(&tmpq),
-				     rd_kafka_msgq_size(&tmpq),
-				     i - partition_cnt);
-
-
-			rd_kafka_toppar_lock(rktp);
-			rd_kafka_msgq_concat(&rktp->rktp_msgq, &tmpq);
-			rd_kafka_toppar_unlock(rktp);
-		}
-
-		rd_kafka_toppar_destroy(rktp_ua); /* .._get() above */
-	} else {
-		/* No UA, fail messages from removed partitions. */
-		if (rd_kafka_msgq_len(&tmpq) > 0) {
-			rd_kafka_dbg(rkt->rkt_rk, TOPIC, "TOPPARMOVE",
-				     "Failing %d messages (%zd bytes) from "
-				     "%d removed partitions",
-				     rd_kafka_msgq_len(&tmpq),
-				     rd_kafka_msgq_size(&tmpq),
-				     i - partition_cnt);
-
-			rd_kafka_dr_msgq(rkt, &tmpq,
-					 RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION);
-		}
 	}
 
 	if (rkt->rkt_p)
@@ -641,7 +648,8 @@ static void rd_kafka_topic_propagate_notexists (rd_kafka_itopic_t *rkt,
 
         /* Notify consumers that the topic doesn't exist. */
         RD_LIST_FOREACH(s_rktp, &rkt->rkt_desp, i)
-                rd_kafka_toppar_enq_error(rd_kafka_toppar_s2i(s_rktp), err);
+                rd_kafka_toppar_enq_error(rd_kafka_toppar_s2i(s_rktp), err,
+                                          "topic does not exist");
 }
 
 
@@ -673,16 +681,17 @@ static void rd_kafka_topic_assign_uas (rd_kafka_itopic_t *rkt,
         rktp_ua = rd_kafka_toppar_s2i(s_rktp_ua);
 
 	/* Assign all unassigned messages to new topics. */
-	rd_kafka_dbg(rk, TOPIC, "PARTCNT",
-		     "Partitioning %i unassigned messages in topic %.*s to "
-		     "%"PRId32" partitions",
-		     rd_atomic32_get(&rktp_ua->rktp_msgq.rkmq_msg_cnt),
-		     RD_KAFKAP_STR_PR(rkt->rkt_topic),
-		     rkt->rkt_partition_cnt);
+        rd_kafka_toppar_lock(rktp_ua);
 
-	rd_kafka_toppar_lock(rktp_ua);
+        rd_kafka_dbg(rk, TOPIC, "PARTCNT",
+                     "Partitioning %i unassigned messages in topic %.*s to "
+                     "%"PRId32" partitions",
+                     rktp_ua->rktp_msgq.rkmq_msg_cnt,
+                     RD_KAFKAP_STR_PR(rkt->rkt_topic),
+                     rkt->rkt_partition_cnt);
+
 	rd_kafka_msgq_move(&uas, &rktp_ua->rktp_msgq);
-	cnt = rd_atomic32_get(&uas.rkmq_msg_cnt);
+	cnt = uas.rkmq_msg_cnt;
 	rd_kafka_toppar_unlock(rktp_ua);
 
 	TAILQ_FOREACH_SAFE(rkm, &uas.rkmq_msgs, rkm_link, tmp) {
@@ -700,18 +709,16 @@ static void rd_kafka_topic_assign_uas (rd_kafka_itopic_t *rkt,
 		}
 	}
 
-	rd_kafka_dbg(rk, TOPIC, "UAS",
-		     "%i/%i messages were partitioned in topic %s",
-		     cnt - rd_atomic32_get(&failed.rkmq_msg_cnt),
-		     cnt, rkt->rkt_topic->str);
+        rd_kafka_dbg(rk, TOPIC, "UAS",
+                     "%i/%i messages were partitioned in topic %s",
+                     cnt - failed.rkmq_msg_cnt, cnt, rkt->rkt_topic->str);
 
-	if (rd_atomic32_get(&failed.rkmq_msg_cnt) > 0) {
-		/* Fail the messages */
-		rd_kafka_dbg(rk, TOPIC, "UAS",
-			     "%"PRId32"/%i messages failed partitioning "
-			     "in topic %s",
-			     rd_atomic32_get(&uas.rkmq_msg_cnt), cnt,
-			     rkt->rkt_topic->str);
+        if (failed.rkmq_msg_cnt > 0) {
+                /* Fail the messages */
+                rd_kafka_dbg(rk, TOPIC, "UAS",
+                             "%"PRId32"/%i messages failed partitioning "
+                             "in topic %s",
+                             failed.rkmq_msg_cnt, cnt, rkt->rkt_topic->str);
 		rd_kafka_dr_msgq(rkt, &failed,
 				 rkt->rkt_state == RD_KAFKA_TOPIC_S_NOTEXISTS ?
 				 err :
@@ -1033,10 +1040,12 @@ void rd_kafka_topic_partitions_remove (rd_kafka_itopic_t *rkt) {
 
 
 /**
- * Scan all topics and partitions for:
+ * @brief Scan all topics and partitions for:
  *  - timed out messages.
  *  - topics that needs to be created on the broker.
  *  - topics who's metadata is too old.
+ *
+ * @locality rdkafka main thread
  */
 int rd_kafka_topic_scan_all (rd_kafka_t *rk, rd_ts_t now) {
 	rd_kafka_itopic_t *rkt;
@@ -1121,11 +1130,6 @@ int rd_kafka_topic_scan_all (rd_kafka_t *rk, rd_ts_t now) {
                                 query_this = 1;
                         }
 
-			/* Scan toppar's message queues for timeouts */
-			if (rd_kafka_msgq_age_scan(&rktp->rktp_xmit_msgq,
-						   &timedout, now) > 0)
-				did_tmout = 1;
-
 			if (rd_kafka_msgq_age_scan(&rktp->rktp_msgq,
 						   &timedout, now) > 0)
 				did_tmout = 1;
@@ -1138,7 +1142,7 @@ int rd_kafka_topic_scan_all (rd_kafka_t *rk, rd_ts_t now) {
 
                 rd_kafka_topic_rdunlock(rkt);
 
-                if ((cnt = rd_atomic32_get(&timedout.rkmq_msg_cnt)) > 0) {
+                if ((cnt = timedout.rkmq_msg_cnt) > 0) {
                         totcnt += cnt;
                         rd_kafka_dbg(rk, MSG, "TIMEOUT",
                                      "%s: %"PRId32" message(s) "

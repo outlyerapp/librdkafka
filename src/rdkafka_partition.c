@@ -48,9 +48,6 @@ static rd_kafka_op_res_t
 rd_kafka_toppar_op_serve (rd_kafka_t *rk,
                           rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
                           rd_kafka_q_cb_type_t cb_type, void *opaque);
-static RD_INLINE void rd_kafka_broker_fetch_toppar_del (rd_kafka_broker_t *rkb,
-                                                       rd_kafka_toppar_t *rktp);
-
 
 
 static RD_INLINE int32_t
@@ -88,6 +85,12 @@ static void rd_kafka_toppar_lag_handle_Offset (rd_kafka_t *rk,
         /* Parse and return Offset */
         err = rd_kafka_handle_Offset(rkb->rkb_rk, rkb, err,
                                      rkbuf, request, offsets);
+
+        if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
+                rd_kafka_topic_partition_list_destroy(offsets);
+                return; /* Retrying */
+        }
+
         if (!err && !(rktpar = rd_kafka_topic_partition_list_find(
                               offsets,
                               rktp->rktp_rkt->rkt_topic->str,
@@ -267,8 +270,8 @@ void rd_kafka_toppar_destroy_final (rd_kafka_toppar_t *rktp) {
 			rd_kafka_msgq_len(&rktp->rktp_xmit_msgq) == 0);
 	rd_kafka_dr_msgq(rktp->rktp_rkt, &rktp->rktp_msgq,
 			 RD_KAFKA_RESP_ERR__DESTROY);
-	rd_kafka_q_destroy(rktp->rktp_fetchq);
-        rd_kafka_q_destroy(rktp->rktp_ops);
+	rd_kafka_q_destroy_owner(rktp->rktp_fetchq);
+        rd_kafka_q_destroy_owner(rktp->rktp_ops);
 
 	rd_kafka_replyq_destroy(&rktp->rktp_replyq);
 
@@ -304,6 +307,16 @@ void rd_kafka_toppar_set_fetch_state (rd_kafka_toppar_t *rktp,
                      rd_kafka_fetch_states[fetch_state]);
 
         rktp->rktp_fetch_state = fetch_state;
+
+        if (fetch_state == RD_KAFKA_TOPPAR_FETCH_ACTIVE)
+                rd_kafka_dbg(rktp->rktp_rkt->rkt_rk,
+                             CONSUMER|RD_KAFKA_DBG_TOPIC,
+                             "FETCH",
+                             "Partition %.*s [%"PRId32"] start fetching "
+                             "at offset %s",
+                             RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                             rktp->rktp_partition,
+                             rd_kafka_offset2str(rktp->rktp_next_offset));
 }
 
 
@@ -609,26 +622,41 @@ void rd_kafka_toppar_desired_del (rd_kafka_toppar_t *rktp) {
  * Append message at tail of 'rktp' message queue.
  */
 void rd_kafka_toppar_enq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm) {
+        int wakeup_fd, queue_len;
 
-	rd_kafka_toppar_lock(rktp);
-	rd_kafka_msgq_enq(&rktp->rktp_msgq, rkm);
+        rd_kafka_toppar_lock(rktp);
+
+        if (!rkm->rkm_u.producer.msgseq &&
+            rktp->rktp_partition != RD_KAFKA_PARTITION_UA)
+                rkm->rkm_u.producer.msgseq = ++rktp->rktp_msgseq;
+
+        if (rktp->rktp_partition == RD_KAFKA_PARTITION_UA ||
+            rktp->rktp_rkt->rkt_conf.queuing_strategy == RD_KAFKA_QUEUE_FIFO) {
+                /* No need for enq_sorted(), this is the oldest message. */
+                queue_len = rd_kafka_msgq_enq(&rktp->rktp_msgq, rkm);
+        } else {
+                queue_len = rd_kafka_msgq_enq_sorted(rktp->rktp_rkt,
+                                                     &rktp->rktp_msgq, rkm);
+        }
+
+        wakeup_fd = rktp->rktp_msgq_wakeup_fd;
+        rd_kafka_toppar_unlock(rktp);
+
 #ifndef _MSC_VER
-        if (rktp->rktp_msgq_wakeup_fd != -1 &&
-            rd_kafka_msgq_len(&rktp->rktp_msgq) == 1) {
+        if (wakeup_fd != -1 && queue_len == 1) {
                 char one = 1;
                 int r;
-                r = rd_write(rktp->rktp_msgq_wakeup_fd, &one, sizeof(one));
+                r = rd_write(wakeup_fd, &one, sizeof(one));
                 if (r == -1)
                         rd_kafka_log(rktp->rktp_rkt->rkt_rk, LOG_ERR, "PARTENQ",
                                      "%s [%"PRId32"]: write to "
                                      "wake-up fd %d failed: %s",
                                      rktp->rktp_rkt->rkt_topic->str,
                                      rktp->rktp_partition,
-                                     rktp->rktp_msgq_wakeup_fd,
+                                     wakeup_fd,
                                      rd_strerror(errno));
         }
 #endif
-        rd_kafka_toppar_unlock(rktp);
 }
 
 
@@ -641,50 +669,163 @@ void rd_kafka_toppar_deq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm) {
 	rd_kafka_toppar_unlock(rktp);
 }
 
+
+void rd_kafka_msgq_insert_msgq (rd_kafka_msgq_t *destq,
+                                rd_kafka_msgq_t *srcq,
+                                int (*cmp) (const void *a, const void *b)) {
+        rd_kafka_msg_t *first, *dest_first;
+
+        first = TAILQ_FIRST(&srcq->rkmq_msgs);
+        if (unlikely(!first)) {
+                /* srcq is empty */
+                return;
+        }
+
+        dest_first = TAILQ_FIRST(&destq->rkmq_msgs);
+
+        /*
+         * Try to optimize insertion of source list.
+         */
+
+        if (unlikely(!dest_first)) {
+                /* Dest queue is empty, simply move the srcq. */
+                rd_kafka_msgq_move(destq, srcq);
+
+                return;
+        }
+
+        /* See if we can optimize the insertion by bulk-loading
+         * the messages in place.
+         * We know that:
+         *  - destq is sorted
+         *  - srcq is sorted
+         *  - there is no overlap between the two.
+         */
+
+        if (cmp(first, dest_first) < 0) {
+                /* Prepend src to dest queue.
+                 * First append existing dest queue to src queue,
+                 * then move src queue to now-empty dest queue,
+                 * effectively prepending src queue to dest queue. */
+                rd_kafka_msgq_concat(srcq, destq);
+                rd_kafka_msgq_move(destq, srcq);
+
+        } else if (cmp(first,
+                       TAILQ_LAST(&destq->rkmq_msgs,
+                                  rd_kafka_msgs_head_s)) > 0) {
+                /* Append src to dest queue */
+                rd_kafka_msgq_concat(destq, srcq);
+
+        } else {
+                /* Source queue messages reside somewhere
+                 * in the dest queue range, find the insert position. */
+                rd_kafka_msg_t *at;
+
+                at = rd_kafka_msgq_find_pos(destq, first, cmp);
+                rd_assert(at &&
+                          *"Bug in msg_order_cmp(): "
+                          "could not find insert position");
+
+                /* Insert input queue after 'at' position.
+                 * We know that:
+                 * - at is non-NULL
+                 * - at is not the last element. */
+                TAILQ_INSERT_LIST(&destq->rkmq_msgs,
+                                  at, &srcq->rkmq_msgs,
+                                  rd_kafka_msgs_head_s,
+                                  rd_kafka_msg_t *, rkm_link);
+
+                destq->rkmq_msg_cnt   += srcq->rkmq_msg_cnt;
+                destq->rkmq_msg_bytes += srcq->rkmq_msg_bytes;
+                rd_kafka_msgq_init(srcq);
+        }
+}
+
+
 /**
- * Inserts all messages from 'rkmq' at head of toppar 'rktp's queue.
- * 'rkmq' will be cleared.
+ * @brief Inserts messages from \p srcq according to their sorted position
+ *        into \p destq, filtering out messages that can not be retried.
+ *
+ * @param incr_retry Increment retry count for messages.
+ * @param max_retries Maximum retries allowed per message.
+ * @param backoff Absolute retry backoff for retried messages.
+ *
+ * @returns the number of messages that could not be retried.
+ */
+int rd_kafka_retry_msgq (rd_kafka_msgq_t *destq,
+                         rd_kafka_msgq_t *srcq,
+                         int incr_retry, int max_retries, rd_ts_t backoff,
+                         int (*cmp) (const void *a, const void *b)) {
+        rd_kafka_msgq_t retryable = RD_KAFKA_MSGQ_INITIALIZER(retryable);
+        rd_kafka_msg_t *rkm, *tmp;
+
+        /* Scan through messages to see which ones are eligible for retry,
+         * move the retryable ones to temporary queue and
+         * set backoff time for first message and optionally
+         * increase retry count for each message.
+         * Sorted insert is not necessary since the original order
+         * srcq order is maintained. */
+        TAILQ_FOREACH_SAFE(rkm, &srcq->rkmq_msgs, rkm_link, tmp) {
+                if (rkm->rkm_u.producer.retries + incr_retry > max_retries)
+                        continue;
+
+                rd_kafka_msgq_deq(srcq, rkm, 1);
+                rd_kafka_msgq_enq(&retryable, rkm);
+
+                rkm->rkm_u.producer.ts_backoff = backoff;
+                rkm->rkm_u.producer.retries  += incr_retry;
+        }
+
+        /* No messages are retryable */
+        if (RD_KAFKA_MSGQ_EMPTY(&retryable))
+                return 0;
+
+        /* Insert retryable list at sorted position */
+        rd_kafka_msgq_insert_msgq(destq, &retryable, cmp);
+
+        return 1;
+}
+
+/**
+ * @brief Inserts messages from \p rkmq according to their sorted position
+ *        into the partition xmit queue (i.e., the broker xmit work queue).
+ *
+ * @param incr_retry Increment retry count for messages.
+ *
+ * @returns the number of messages that could not be retried.
+ *
+ * @locality Broker thread
+ */
+
+int rd_kafka_toppar_retry_msgq (rd_kafka_toppar_t *rktp, rd_kafka_msgq_t *rkmq,
+                                int incr_retry) {
+        rd_kafka_t *rk = rktp->rktp_rkt->rkt_rk;
+        rd_ts_t backoff = rd_clock() + (rk->rk_conf.retry_backoff_ms * 1000);
+        int r;
+
+        rd_kafka_toppar_lock(rktp);
+        r = rd_kafka_retry_msgq(&rktp->rktp_xmit_msgq, rkmq,
+                                incr_retry, rk->rk_conf.max_retries,
+                                backoff,
+                                rktp->rktp_rkt->rkt_conf.msg_order_cmp);
+        rd_kafka_toppar_unlock(rktp);
+
+        return r;
+}
+
+/**
+ * @brief Insert sorted message list \p rkmq at sorted position in \p rktp 's
+ *        message queue. The queues must not overlap.
+ * @remark \p rkmq will be cleared.
  */
 void rd_kafka_toppar_insert_msgq (rd_kafka_toppar_t *rktp,
-				  rd_kafka_msgq_t *rkmq) {
-	rd_kafka_toppar_lock(rktp);
-	rd_kafka_msgq_concat(rkmq, &rktp->rktp_msgq);
-	rd_kafka_msgq_move(&rktp->rktp_msgq, rkmq);
-	rd_kafka_toppar_unlock(rktp);
+                                  rd_kafka_msgq_t *rkmq) {
+        rd_kafka_toppar_lock(rktp);
+        rd_kafka_msgq_insert_msgq(&rktp->rktp_msgq, rkmq,
+                                  rktp->rktp_rkt->rkt_conf.msg_order_cmp);
+        rd_kafka_toppar_unlock(rktp);
 }
 
-
-/**
- * Concats all messages from 'rkmq' at tail of toppar 'rktp's queue.
- * 'rkmq' will be cleared.
- */
-void rd_kafka_toppar_concat_msgq (rd_kafka_toppar_t *rktp,
-				  rd_kafka_msgq_t *rkmq) {
-	rd_kafka_toppar_lock(rktp);
-	rd_kafka_msgq_concat(&rktp->rktp_msgq, rkmq);
-	rd_kafka_toppar_unlock(rktp);
-}
-
-/**
- * Move all messages in 'rkmq' to the unassigned partition, if any.
- * Returns 0 on success or -1 if there was no UA partition.
- */
-int rd_kafka_toppar_ua_move (rd_kafka_itopic_t *rkt, rd_kafka_msgq_t *rkmq) {
-	shptr_rd_kafka_toppar_t *s_rktp_ua;
-
-	rd_kafka_topic_rdlock(rkt);
-	s_rktp_ua = rd_kafka_toppar_get(rkt, RD_KAFKA_PARTITION_UA, 0);
-	rd_kafka_topic_rdunlock(rkt);
-
-	if (unlikely(s_rktp_ua == NULL))
-		return -1;
-
-	rd_kafka_msgq_concat(&rd_kafka_toppar_s2i(s_rktp_ua)->rktp_msgq, rkmq);
-
-	rd_kafka_toppar_destroy(s_rktp_ua);
-
-	return 0;
-}
 
 
 /**
@@ -874,8 +1015,8 @@ void rd_kafka_toppar_broker_delegate (rd_kafka_toppar_t *rktp,
 			     RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
 			     rktp->rktp_partition,
 			     rd_kafka_broker_name(rkb),
-			     rd_atomic32_get(&rktp->rktp_msgq.rkmq_msg_cnt),
-			     rd_atomic64_get(&rktp->rktp_msgq.rkmq_msg_bytes));
+                             rktp->rktp_msgq.rkmq_msg_cnt,
+                             rktp->rktp_msgq.rkmq_msg_bytes);
 
 
 	} else {
@@ -1083,7 +1224,7 @@ static void rd_kafka_toppar_handle_Offset (rd_kafka_t *rk,
 
 	rd_kafka_toppar_lock(rktp);
 	/* Drop reply from previous partition leader */
-	if (rktp->rktp_leader != rkb)
+	if (err != RD_KAFKA_RESP_ERR__DESTROY && rktp->rktp_leader != rkb)
 		err = RD_KAFKA_RESP_ERR__OUTDATED;
 	rd_kafka_toppar_unlock(rktp);
 
@@ -1531,7 +1672,9 @@ static void rd_kafka_toppar_pause_resume (rd_kafka_toppar_t *rktp,
 		if (rk->rk_type == RD_KAFKA_CONSUMER) {
 			/* Save offset of last consumed message+1 as the
 			 * next message to fetch on resume. */
-			rktp->rktp_next_offset = rktp->rktp_app_offset;
+			if (rktp->rktp_app_offset != RD_KAFKA_OFFSET_INVALID) {
+				rktp->rktp_next_offset = rktp->rktp_app_offset;
+			}
 
 			rd_kafka_dbg(rk, TOPIC, pause?"PAUSE":"RESUME",
 				     "%s %s [%"PRId32"]: at offset %s "
@@ -1608,66 +1751,6 @@ static void rd_kafka_toppar_pause_resume (rd_kafka_toppar_t *rktp,
 	}
 }
 
-
-
-
-/**
- * Add toppar to fetch list.
- *
- * Locality: broker thread
- * Locks: none
- */
-static RD_INLINE void rd_kafka_broker_fetch_toppar_add (rd_kafka_broker_t *rkb,
-                                                       rd_kafka_toppar_t *rktp){
-        if (rktp->rktp_fetch)
-                return; /* Already added */
-
-        CIRCLEQ_INSERT_TAIL(&rkb->rkb_fetch_toppars, rktp, rktp_fetchlink);
-        rkb->rkb_fetch_toppar_cnt++;
-        rktp->rktp_fetch = 1;
-
-        if (unlikely(rkb->rkb_fetch_toppar_cnt == 1))
-                rd_kafka_broker_fetch_toppar_next(rkb, rktp);
-
-        rd_rkb_dbg(rkb, TOPIC, "FETCHADD",
-                   "Added %.*s [%"PRId32"] to fetch list (%d entries, opv %d)",
-                   RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
-                   rktp->rktp_partition,
-                   rkb->rkb_fetch_toppar_cnt, rktp->rktp_fetch_version);
-}
-
-
-/**
- * Remove toppar from fetch list.
- *
- * Locality: broker thread
- * Locks: none
- */
-static RD_INLINE void rd_kafka_broker_fetch_toppar_del (rd_kafka_broker_t *rkb,
-                                                       rd_kafka_toppar_t *rktp){
-        if (!rktp->rktp_fetch)
-                return; /* Not added */
-
-        CIRCLEQ_REMOVE(&rkb->rkb_fetch_toppars, rktp, rktp_fetchlink);
-        rd_kafka_assert(NULL, rkb->rkb_fetch_toppar_cnt > 0);
-        rkb->rkb_fetch_toppar_cnt--;
-        rktp->rktp_fetch = 0;
-
-        if (rkb->rkb_fetch_toppar_next == rktp) {
-                /* Update next pointer */
-                rd_kafka_broker_fetch_toppar_next(
-			rkb, CIRCLEQ_LOOP_NEXT(&rkb->rkb_fetch_toppars,
-					       rktp, rktp_fetchlink));
-        }
-
-        rd_rkb_dbg(rkb, TOPIC, "FETCHADD",
-                   "Removed %.*s [%"PRId32"] from fetch list "
-                   "(%d entries, opv %d)",
-                   RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
-                   rktp->rktp_partition,
-                   rkb->rkb_fetch_toppar_cnt, rktp->rktp_fetch_version);
-
-}
 
 
 
@@ -1793,9 +1876,9 @@ rd_ts_t rd_kafka_toppar_fetch_decide (rd_kafka_toppar_t *rktp,
 
                 if (should_fetch) {
 			rd_dassert(rktp->rktp_fetch_version > 0);
-                        rd_kafka_broker_fetch_toppar_add(rkb, rktp);
+                        rd_kafka_broker_active_toppar_add(rkb, rktp);
                 } else {
-                        rd_kafka_broker_fetch_toppar_del(rkb, rktp);
+                        rd_kafka_broker_active_toppar_del(rkb, rktp);
                         /* Non-fetching partitions will have an
                          * indefinate backoff, unless explicitly specified. */
                         if (!ts_backoff)
@@ -2218,13 +2301,21 @@ rd_kafka_toppars_pause_resume (rd_kafka_t *rk, int pause, int flag,
  * Propagate error for toppar
  */
 void rd_kafka_toppar_enq_error (rd_kafka_toppar_t *rktp,
-                                rd_kafka_resp_err_t err) {
+                                rd_kafka_resp_err_t err,
+                                const char *reason) {
         rd_kafka_op_t *rko;
+        char buf[512];
 
         rko = rd_kafka_op_new(RD_KAFKA_OP_ERR);
         rko->rko_err  = err;
         rko->rko_rktp = rd_kafka_toppar_keep(rktp);
-        rko->rko_u.err.errstr = rd_strdup(rd_kafka_err2str(rko->rko_err));
+
+        rd_snprintf(buf, sizeof(buf), "%.*s [%"PRId32"]: %s (%s)",
+                    RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                    rktp->rktp_partition, reason,
+                    rd_kafka_err2str(err));
+
+        rko->rko_u.err.errstr = rd_strdup(buf);
 
         rd_kafka_q_enq(rktp->rktp_fetchq, rko);
 }
@@ -2996,16 +3087,16 @@ rd_kafka_topic_partition_list_query_leaders (
                 } else {
                         /* Wait for broker ids to be updated from
                          * metadata refresh above. */
-                        int wait_ms = rd_timeout_remains(ts_end);
-                        if (query_intvl < wait_ms)
-                                wait_ms = query_intvl;
-                        rd_kafka_metadata_cache_wait_change(rk, query_intvl);
+                        int wait_ms = rd_timeout_remains_limit(ts_end,
+                                                               query_intvl);
+                        rd_kafka_metadata_cache_wait_change(rk, wait_ms);
                 }
 
                 rd_list_destroy(&query_topics);
 
                 i++;
-        } while (now < ts_end); /* now is deliberately outdated here
+        } while (ts_end == RD_POLL_INFINITE ||
+                 now < ts_end); /* now is deliberately outdated here
                                  * since wait_change() will block.
                                  * This gives us one more chance to spin thru*/
 
@@ -3115,16 +3206,16 @@ rd_kafka_topic_partition_list_t *rd_kafka_topic_partition_list_match (
 }
 
 void
-rd_kafka_topic_partition_list_log (rd_kafka_t *rk, const char *fac,
+rd_kafka_topic_partition_list_log (rd_kafka_t *rk, const char *fac, int dbg,
 				   const rd_kafka_topic_partition_list_t *rktparlist) {
         int i;
 
-	rd_kafka_dbg(rk, TOPIC, fac, "List with %d partition(s):",
+	rd_kafka_dbg(rk, NONE|dbg, fac, "List with %d partition(s):",
 		     rktparlist->cnt);
         for (i = 0 ; i < rktparlist->cnt ; i++) {
 		const rd_kafka_topic_partition_t *rktpar =
 			&rktparlist->elems[i];
-		rd_kafka_dbg(rk, TOPIC, fac, " %s [%"PRId32"] offset %s%s%s",
+		rd_kafka_dbg(rk, NONE|dbg, fac, " %s [%"PRId32"] offset %s%s%s",
 			     rktpar->topic, rktpar->partition,
 			     rd_kafka_offset2str(rktpar->offset),
 			     rktpar->err ? ": error: " : "",
@@ -3151,8 +3242,8 @@ rd_kafka_topic_partition_list_str (const rd_kafka_topic_partition_list_t *rktpar
                 int r;
 
                 if (trunc) {
-                        if (dest_size > 3)
-                                rd_snprintf(&dest[dest_size-3], 3, "...");
+                        if (dest_size > 4)
+                                rd_snprintf(&dest[dest_size-4], 4, "...");
                         break;
                 }
 

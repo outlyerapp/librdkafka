@@ -25,7 +25,8 @@
 * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 * POSSIBILITY OF SUCH DAMAGE.
 */
-#pragma once
+#ifndef _TESTSHARED_H_
+#define _TESTSHARED_H_
 
 /**
  * C variables and functions shared with C++ tests
@@ -43,13 +44,15 @@ extern int tmout_multip (int msecs);
         (((V) >> (24-((I)*8))) & 0xff)
 
 extern int test_broker_version;
-
+extern int test_on_ci;
 
 const char *test_mk_topic_name (const char *suffix, int randomized);
 
 uint64_t
-test_produce_msgs_easy (const char *topic, uint64_t testid,
-                        int32_t partition, int msgcnt);
+test_produce_msgs_easy_size (const char *topic, uint64_t testid,
+                             int32_t partition, int msgcnt, size_t size);
+#define test_produce_msgs_easy(topic,testid,partition,msgcnt) \
+        test_produce_msgs_easy_size(topic,testid,partition,msgcnt,0)
 
 void test_FAIL (const char *file, int line, int fail_now, const char *str);
 void test_SAY (const char *file, int line, int level, const char *str);
@@ -116,10 +119,14 @@ typedef struct test_timing_s {
 /**
  * @brief Start timing, Va-Argument is textual name (printf format)
  */
-#define TIMING_START(TIMING,...) do {                                   \
-        rd_snprintf((TIMING)->name, sizeof((TIMING)->name), __VA_ARGS__); \
+#define TIMING_RESTART(TIMING) do {                                     \
         (TIMING)->ts_start = test_clock();                              \
         (TIMING)->duration = 0;                                         \
+        } while (0)
+
+#define TIMING_START(TIMING,...) do {                                   \
+        rd_snprintf((TIMING)->name, sizeof((TIMING)->name), __VA_ARGS__); \
+        TIMING_RESTART(TIMING);                                         \
         (TIMING)->ts_every = (TIMING)->ts_start;                        \
         } while (0)
 
@@ -129,6 +136,10 @@ typedef struct test_timing_s {
         TEST_SAY("%s: duration %.3fms\n",                               \
                  (TIMING)->name, (float)(TIMING)->duration / 1000.0f);  \
         } while (0)
+#define TIMING_REPORT(TIMING) \
+        TEST_SAY("%s: duration %.3fms\n",                               \
+                 (TIMING)->name, (float)(TIMING)->duration / 1000.0f);  \
+
 #else
 #define TIMING_STOP(TIMING) do {                                        \
         char _str[128];                                                 \
@@ -159,3 +170,11 @@ static RD_UNUSED int TIMING_EVERY (test_timing_t *timing, int us) {
 #else
 #define rd_sleep(S) Sleep((S)*1000)
 #endif
+
+/* Make sure __SANITIZE_ADDRESS__ (gcc) is defined if compiled with asan */
+#if !defined(__SANITIZE_ADDRESS__) && defined(__has_feature)
+ #if __has_feature(address_sanitizer)
+ #define __SANITIZE_ADDRESS__ 1
+ #endif
+#endif
+#endif /* _TESTSHARED_H_ */

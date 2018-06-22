@@ -32,6 +32,7 @@
 #include "rdkafka_msgset.h"
 #include "rdkafka_topic.h"
 #include "rdkafka_partition.h"
+#include "rdkafka_header.h"
 #include "rdkafka_lz4.h"
 
 #include "snappy.h"
@@ -364,11 +365,13 @@ rd_kafka_msgset_writer_write_Produce_header (rd_kafka_msgset_writer_t *msetw) {
  *
  * @remark This currently constructs the entire ProduceRequest, containing
  *         a single outer MessageSet for a single partition.
+ *
+ * @locality broker thread
  */
 static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
                                          rd_kafka_broker_t *rkb,
                                          rd_kafka_toppar_t *rktp) {
-        int msgcnt = rd_atomic32_get(&rktp->rktp_xmit_msgq.rkmq_msg_cnt);
+        int msgcnt = rktp->rktp_xmit_msgq.rkmq_msg_cnt;
 
         if (msgcnt == 0)
                 return 0;
@@ -433,13 +436,50 @@ rd_kafka_msgset_writer_write_msg_payload (rd_kafka_msgset_writer_t *msetw,
          * room in the buffer we'll copy the payload to the buffer,
          * otherwise we push a reference to the memory. */
         if (rkm->rkm_len <= (size_t)rk->rk_conf.msg_copy_max_size &&
-            rd_buf_write_remains(&rkbuf->rkbuf_buf) > rkm->rkm_len)
+            rd_buf_write_remains(&rkbuf->rkbuf_buf) > rkm->rkm_len) {
                 rd_kafka_buf_write(rkbuf,
                                    rkm->rkm_payload, rkm->rkm_len);
-        else
+                if (free_cb)
+                        free_cb(rkm->rkm_payload);
+        } else
                 rd_kafka_buf_push(rkbuf, rkm->rkm_payload, rkm->rkm_len,
                                   free_cb);
 }
+
+
+/**
+ * @brief Write message headers to buffer.
+ *
+ * @remark The enveloping HeaderCount varint must already have been written.
+ * @returns the number of bytes written to msetw->msetw_rkbuf
+ */
+static size_t
+rd_kafka_msgset_writer_write_msg_headers (rd_kafka_msgset_writer_t *msetw,
+                                          const rd_kafka_headers_t *hdrs) {
+        rd_kafka_buf_t *rkbuf = msetw->msetw_rkbuf;
+        const rd_kafka_header_t *hdr;
+        int i;
+        size_t start_pos = rd_buf_write_pos(&rkbuf->rkbuf_buf);
+        size_t written;
+
+        RD_LIST_FOREACH(hdr, &hdrs->rkhdrs_list, i) {
+                rd_kafka_buf_write_varint(rkbuf, hdr->rkhdr_name_size);
+                rd_kafka_buf_write(rkbuf,
+                                   hdr->rkhdr_name, hdr->rkhdr_name_size);
+                rd_kafka_buf_write_varint(rkbuf,
+                                          hdr->rkhdr_value ?
+                                          (int64_t)hdr->rkhdr_value_size : -1);
+                rd_kafka_buf_write(rkbuf,
+                                   hdr->rkhdr_value,
+                                   hdr->rkhdr_value_size);
+        }
+
+        written = rd_buf_write_pos(&rkbuf->rkbuf_buf) - start_pos;
+        rd_dassert(written == hdrs->rkhdrs_ser_size);
+
+        return written;
+}
+
 
 
 /**
@@ -536,6 +576,13 @@ rd_kafka_msgset_writer_write_msg_v2 (rd_kafka_msgset_writer_t *msetw,
         size_t sz_KeyLen;
         size_t sz_ValueLen;
         size_t sz_HeaderCount;
+        int    HeaderCount = 0;
+        size_t HeaderSize = 0;
+
+        if (rkm->rkm_headers) {
+                HeaderCount = rkm->rkm_headers->rkhdrs_list.rl_cnt;
+                HeaderSize  = rkm->rkm_headers->rkhdrs_ser_size;
+        }
 
         /* All varints, except for Length, needs to be pre-built
          * so that the Length field can be set correctly and thus have
@@ -555,7 +602,8 @@ rd_kafka_msgset_writer_write_msg_v2 (rd_kafka_msgset_writer_t *msetw,
                 rkm->rkm_payload ? (int32_t)rkm->rkm_len :
                 (int32_t)RD_KAFKAP_BYTES_LEN_NULL);
         sz_HeaderCount = rd_uvarint_enc_i32(
-                varint_HeaderCount, sizeof(varint_HeaderCount), 0);
+                varint_HeaderCount, sizeof(varint_HeaderCount),
+                (int32_t)HeaderCount);
 
         /* Calculate MessageSize without length of Length (added later)
          * to store it in Length. */
@@ -567,7 +615,8 @@ rd_kafka_msgset_writer_write_msg_v2 (rd_kafka_msgset_writer_t *msetw,
                 rkm->rkm_key_len +
                 sz_ValueLen +
                 rkm->rkm_len +
-                sz_HeaderCount;
+                sz_HeaderCount +
+                HeaderSize;
 
         /* Length */
         sz_Length = rd_uvarint_enc_i64(varint_Length, sizeof(varint_Length),
@@ -599,8 +648,13 @@ rd_kafka_msgset_writer_write_msg_v2 (rd_kafka_msgset_writer_t *msetw,
         if (rkm->rkm_payload)
                 rd_kafka_msgset_writer_write_msg_payload(msetw, rkm, free_cb);
 
-        /* HeaderCount (headers currently not implemented) */
+        /* HeaderCount */
         rd_kafka_buf_write(rkbuf, varint_HeaderCount, sz_HeaderCount);
+
+        /* Headers array */
+        if (rkm->rkm_headers)
+                rd_kafka_msgset_writer_write_msg_headers(msetw,
+                                                         rkm->rkm_headers);
 
         /* Return written message size */
         return MessageSize;
@@ -649,6 +703,8 @@ rd_kafka_msgset_writer_write_msg (rd_kafka_msgset_writer_t *msetw,
 /**
  * @brief Write as many messages from the given message queue to
  *        the messageset.
+ *
+ *        May not write any messages.
  */
 static void
 rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
@@ -663,10 +719,11 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
         rd_ts_t MaxTimestamp = 0;
         rd_kafka_msg_t *rkm;
         int msgcnt = 0;
+        const rd_ts_t now = rd_clock();
 
         /* Internal latency calculation base.
          * Uses rkm_ts_timeout which is enqueue time + timeout */
-        int_latency_base = rd_clock() +
+        int_latency_base = now +
                 (rktp->rktp_rkt->rkt_conf.message_timeout_ms * 1000);
 
         /* Acquire BaseTimestamp from first message. */
@@ -687,6 +744,12 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
                                    "No more space in current MessageSet "
                                    "(%i message(s), %"PRIusz" bytes)",
                                    msgcnt, len);
+                        break;
+                }
+
+                if (unlikely(rkm->rkm_u.producer.ts_backoff > now)) {
+                        /* Stop accumulation when we've reached
+                         * a message with a retry backoff in the future */
                         break;
                 }
 
@@ -1144,6 +1207,8 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
  *
  * @returns the buffer to transmit or NULL if there were no messages
  *          in messageset.
+ *
+ * @locality broker thread
  */
 rd_kafka_buf_t *
 rd_kafka_msgset_create_ProduceRequest (rd_kafka_broker_t *rkb,

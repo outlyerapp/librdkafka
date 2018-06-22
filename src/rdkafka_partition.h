@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_PARTITION_H_
+#define _RDKAFKA_PARTITION_H_
 
 #include "rdkafka_topic.h"
 #include "rdkafka_cgrp.h"
@@ -60,7 +61,7 @@ static RD_UNUSED void rd_kafka_offset_stats_reset (struct offset_stats *offs) {
 struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 	TAILQ_ENTRY(rd_kafka_toppar_s) rktp_rklink;  /* rd_kafka_t link */
 	TAILQ_ENTRY(rd_kafka_toppar_s) rktp_rkblink; /* rd_kafka_broker_t link*/
-        CIRCLEQ_ENTRY(rd_kafka_toppar_s) rktp_fetchlink; /* rkb_fetch_toppars */
+        CIRCLEQ_ENTRY(rd_kafka_toppar_s) rktp_activelink; /* rkb_active_toppars */
 	TAILQ_ENTRY(rd_kafka_toppar_s) rktp_rktlink; /* rd_kafka_itopic_t link*/
         TAILQ_ENTRY(rd_kafka_toppar_s) rktp_cgrplink;/* rd_kafka_cgrp_t link */
         rd_kafka_itopic_t       *rktp_rkt;
@@ -82,15 +83,15 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 	rd_refcnt_t        rktp_refcnt;
 	mtx_t              rktp_lock;
 
-        //LOCK: toppar_lock. Should move the lock inside the msgq instead
         //LOCK: toppar_lock. toppar_insert_msg(), concat_msgq()
-        //LOCK: toppar_lock. toppar_enq_msg(), deq_msg(), insert_msgq()
+        //LOCK: toppar_lock. toppar_enq_msg(), deq_msg(), toppar_retry_msgq()
         int                rktp_msgq_wakeup_fd; /* Wake-up fd */
 	rd_kafka_msgq_t    rktp_msgq;      /* application->rdkafka queue.
 					    * protected by rktp_lock */
-	rd_kafka_msgq_t    rktp_xmit_msgq; /* internal broker xmit queue */
+        rd_kafka_msgq_t    rktp_xmit_msgq; /* internal broker xmit queue.
+                                            * local to broker thread. */
 
-        int                rktp_fetch;     /* On rkb_fetch_toppars list */
+        int                rktp_fetch;     /* On rkb_active_toppars list */
 
 	/* Consumer */
 	rd_kafka_q_t      *rktp_fetchq;          /* Queue of fetched messages
@@ -98,6 +99,16 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
                                                   * Broker thread -> App */
         rd_kafka_q_t      *rktp_ops;             /* * -> Main thread */
 
+        uint64_t           rktp_msgseq;     /* Current message sequence number.
+                                             * Each message enqueued on a
+                                             * non-UA partition will get a
+                                             * unique sequencial number assigned.
+                                             * This number is used to
+                                             * re-enqueue the message
+                                             * on resends but making sure
+                                             * the input ordering is still
+                                             * maintained.
+                                             * Starts at 1. */
 
 	/**
 	 * rktp version barriers
@@ -322,12 +333,21 @@ void rd_kafka_toppar_set_fetch_state (rd_kafka_toppar_t *rktp,
 void rd_kafka_toppar_insert_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
 void rd_kafka_toppar_enq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
 void rd_kafka_toppar_deq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
+int rd_kafka_retry_msgq (rd_kafka_msgq_t *destq,
+                         rd_kafka_msgq_t *srcq,
+                         int incr_retry, int max_retries, rd_ts_t backoff,
+                         int (*cmp) (const void *a, const void *b));
+void rd_kafka_msgq_insert_msgq (rd_kafka_msgq_t *destq,
+                                rd_kafka_msgq_t *srcq,
+                                int (*cmp) (const void *a, const void *b));
+int  rd_kafka_toppar_retry_msgq (rd_kafka_toppar_t *rktp,
+                                 rd_kafka_msgq_t *rkmq,
+                                 int incr_retry);
 void rd_kafka_toppar_insert_msgq (rd_kafka_toppar_t *rktp,
-				  rd_kafka_msgq_t *rkmq);
-void rd_kafka_toppar_concat_msgq (rd_kafka_toppar_t *rktp,
-				  rd_kafka_msgq_t *rkmq);
+                                  rd_kafka_msgq_t *rkmq);
 void rd_kafka_toppar_enq_error (rd_kafka_toppar_t *rktp,
-                                rd_kafka_resp_err_t err);
+                                rd_kafka_resp_err_t err,
+                                const char *reason);
 shptr_rd_kafka_toppar_t *rd_kafka_toppar_get0 (const char *func, int line,
                                                const rd_kafka_itopic_t *rkt,
                                                int32_t partition,
@@ -353,8 +373,6 @@ shptr_rd_kafka_toppar_t *rd_kafka_toppar_desired_add (rd_kafka_itopic_t *rkt,
 void rd_kafka_toppar_desired_link (rd_kafka_toppar_t *rktp);
 void rd_kafka_toppar_desired_unlink (rd_kafka_toppar_t *rktp);
 void rd_kafka_toppar_desired_del (rd_kafka_toppar_t *rktp);
-
-int rd_kafka_toppar_ua_move (rd_kafka_itopic_t *rkt, rd_kafka_msgq_t *rkmq);
 
 void rd_kafka_toppar_next_offset_handle (rd_kafka_toppar_t *rktp,
                                          int64_t Offset);
@@ -385,21 +403,6 @@ rd_kafka_resp_err_t rd_kafka_toppar_op_pause (rd_kafka_toppar_t *rktp,
 void rd_kafka_toppar_fetch_stopped (rd_kafka_toppar_t *rktp,
                                     rd_kafka_resp_err_t err);
 
-/**
- * Updates the current toppar fetch round-robin next pointer.
- */
-static RD_INLINE RD_UNUSED
-void rd_kafka_broker_fetch_toppar_next (rd_kafka_broker_t *rkb,
-                                        rd_kafka_toppar_t *sugg_next) {
-        if (CIRCLEQ_EMPTY(&rkb->rkb_fetch_toppars) ||
-            (void *)sugg_next == CIRCLEQ_ENDC(&rkb->rkb_fetch_toppars))
-                rkb->rkb_fetch_toppar_next = NULL;
-        else if (sugg_next)
-                rkb->rkb_fetch_toppar_next = sugg_next;
-        else
-                rkb->rkb_fetch_toppar_next =
-                        CIRCLEQ_FIRST(&rkb->rkb_fetch_toppars);
-}
 
 
 rd_ts_t rd_kafka_toppar_fetch_decide (rd_kafka_toppar_t *rktp,
@@ -507,7 +510,7 @@ rd_kafka_topic_partition_list_get_topic_names (
         rd_list_t *topics, int include_regex);
 
 void
-rd_kafka_topic_partition_list_log (rd_kafka_t *rk, const char *fac,
+rd_kafka_topic_partition_list_log (rd_kafka_t *rk, const char *fac, int dbg,
 				   const rd_kafka_topic_partition_list_t *rktparlist);
 
 #define RD_KAFKA_FMT_F_OFFSET    0x1  /* Print offset */
@@ -634,3 +637,5 @@ int rd_kafka_partition_leader_cmp (const void *_a, const void *_b) {
         const struct rd_kafka_partition_leader *a = _a, *b = _b;
         return rd_kafka_broker_cmp(a->rkb, b->rkb);
 }
+
+#endif /* _RDKAFKA_PARTITION_H_ */

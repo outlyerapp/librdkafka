@@ -1,7 +1,7 @@
 librdkafka - the Apache Kafka C/C++ client library
 ==================================================
 
-Copyright (c) 2012-2016, [Magnus Edenhill](http://www.edenhill.se/).
+Copyright (c) 2012-2018, [Magnus Edenhill](http://www.edenhill.se/).
 
 [https://github.com/edenhill/librdkafka](https://github.com/edenhill/librdkafka)
 
@@ -37,7 +37,7 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * Debian package: librdkafka1 and librdkafka-dev in Debian and Ubuntu
   * RPM package: librdkafka and librdkafka-devel
   * Gentoo package: dev-libs/librdkafka
-  * Portable: runs on Linux, OSX, Win32, Solaris, FreeBSD, ...
+  * Portable: runs on Linux, OSX, Win32, Solaris, FreeBSD, AIX, ...
 
 
 # Language bindings #
@@ -61,6 +61,7 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * Python: [confluent-kafka-python](https://github.com/confluentinc/confluent-kafka-python)
   * Python: [PyKafka](https://github.com/Parsely/pykafka)
   * Ruby: [Hermann](https://github.com/reiseburo/hermann)
+  * Ruby: [rdkafka-ruby](https://github.com/appsignal/rdkafka-ruby)
   * Rust: [rust-rdkafka](https://github.com/fede1024/rust-rdkafka)
   * Tcl: [KafkaTcl](https://github.com/flightaware/kafkatcl)
   * Swift: [Perfect-Kafka](https://github.com/PerfectlySoft/Perfect-Kafka)
@@ -82,8 +83,11 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * [OVH](http://ovh.com) - [AntiDDOS](http://www.slideshare.net/hugfrance/hugfr-6-oct2014ovhantiddos)
   * [otto.de](http://otto.de)'s [trackdrd](https://github.com/otto-de/trackrdrd) - Varnish log reader
   * [Microwish](https://github.com/microwish) has a range of Kafka utilites for log aggregation, HDFS integration, etc.
-  * [aidp](https://github.com/weiboad/aidp) - kafka consumer embedded Lua scripting language in data process framework 
-  * large unnamed financial institution
+  * [aidp](https://github.com/weiboad/aidp) - kafka consumer embedded Lua scripting language in data process framework
+  * [Yandex ClickHouse](https://github.com/yandex/ClickHouse)
+  * [NXLog](http://nxlog.co/) - Enterprise logging system, Kafka input/output plugin.
+  * large unnamed financial institutions
+  * and many more..
   * *Let [me](mailto:rdkafka@edenhill.se) know if you are using librdkafka*
 
 
@@ -109,6 +113,10 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
 
 **NOTE**: See [README.win32](README.win32) for instructions how to build
           on Windows with Microsoft Visual Studio.
+
+**NOTE**: See [CMake instructions](packaging/cmake/README.md) for experimental
+          CMake build (unsupported).
+
 
 ### Usage in code
 

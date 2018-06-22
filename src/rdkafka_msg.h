@@ -26,11 +26,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#ifndef _RDKAFKA_MSG_H_
+#define _RDKAFKA_MSG_H_
 
 #include "rdsysqueue.h"
 
 #include "rdkafka_proto.h"
+#include "rdkafka_header.h"
+
+
+/**
+ * @brief Internal RD_KAFKA_MSG_F_.. flags
+ */
+#define RD_KAFKA_MSG_F_RKT_RDLOCKED    0x100000 /* rkt is rdlock():ed */
 
 
 /**
@@ -77,6 +85,7 @@ typedef struct rd_kafka_msg_s {
 	 *         the RD_KAFKA_MSG_F_* flags in rdkafka.h */
 #define RD_KAFKA_MSG_F_FREE_RKM     0x10000 /* msg_t is allocated */
 #define RD_KAFKA_MSG_F_ACCOUNT      0x20000 /* accounted for in curr_msgs */
+#define RD_KAFKA_MSG_F_PRODUCER     0x40000 /* Producer message */
 
 	int64_t    rkm_timestamp;  /* Message format V1.
 				    * Meaning of timestamp depends on
@@ -85,13 +94,26 @@ typedef struct rd_kafka_msg_s {
 				    * Unit is milliseconds since epoch (UTC).*/
 	rd_kafka_timestamp_type_t rkm_tstype; /* rkm_timestamp type */
 
+        rd_kafka_headers_t *rkm_headers; /**< Parsed headers list, if any. */
+
         union {
                 struct {
                         rd_ts_t ts_timeout; /* Message timeout */
                         rd_ts_t ts_enq;     /* Enqueue/Produce time */
+                        rd_ts_t ts_backoff; /* Backoff next Produce until
+                                             * this time. */
+                        uint64_t msgseq;    /* Message sequence number,
+                                             * used to maintain ordering. */
+                        int     retries;    /* Number of retries so far */
                 } producer;
 #define rkm_ts_timeout rkm_u.producer.ts_timeout
 #define rkm_ts_enq     rkm_u.producer.ts_enq
+
+                struct {
+                        rd_kafkap_bytes_t binhdrs; /**< Unparsed
+                                                    *   binary headers in
+                                                    *   protocol msg */
+                } consumer;
         } rkm_u;
 } rd_kafka_msg_t;
 
@@ -113,8 +135,14 @@ size_t rd_kafka_msg_wire_size (const rd_kafka_msg_t *rkm, int MsgVersion) {
                 [1] = RD_KAFKAP_MESSAGE_V1_OVERHEAD,
                 [2] = RD_KAFKAP_MESSAGE_V2_OVERHEAD
         };
+        size_t size;
         rd_dassert(MsgVersion >= 0 && MsgVersion <= 2);
-        return overheads[MsgVersion] + rkm->rkm_len + rkm->rkm_key_len;
+
+        size = overheads[MsgVersion] + rkm->rkm_len + rkm->rkm_key_len;
+        if (MsgVersion == 2 && rkm->rkm_headers)
+                size += rd_kafka_headers_serialized_size(rkm->rkm_headers);
+
+        return size;
 }
 
 
@@ -131,10 +159,14 @@ rd_kafka_msg_t *rd_kafka_message2msg (rd_kafka_message_t *rkmessage) {
 
 
 
+/**
+ * @brief Message queue with message and byte counters.
+ */
+TAILQ_HEAD(rd_kafka_msgs_head_s, rd_kafka_msg_s);
 typedef struct rd_kafka_msgq_s {
-	TAILQ_HEAD(, rd_kafka_msg_s) rkmq_msgs;
-	rd_atomic32_t rkmq_msg_cnt;
-	rd_atomic64_t rkmq_msg_bytes;
+        struct rd_kafka_msgs_head_s rkmq_msgs;  /* TAILQ_HEAD */
+        int32_t rkmq_msg_cnt;
+        int64_t rkmq_msg_bytes;
 } rd_kafka_msgq_t;
 
 #define RD_KAFKA_MSGQ_INITIALIZER(rkmq) \
@@ -143,18 +175,21 @@ typedef struct rd_kafka_msgq_s {
 #define RD_KAFKA_MSGQ_FOREACH(elm,head) \
 	TAILQ_FOREACH(elm, &(head)->rkmq_msgs, rkm_link)
 
+/* @brief Check if queue is empty. Proper locks must be held. */
+#define RD_KAFKA_MSGQ_EMPTY(rkmq) TAILQ_EMPTY(&(rkmq)->rkmq_msgs)
+
 /**
  * Returns the number of messages in the specified queue.
  */
 static RD_INLINE RD_UNUSED int rd_kafka_msgq_len (rd_kafka_msgq_t *rkmq) {
-	return (int)rd_atomic32_get(&rkmq->rkmq_msg_cnt);
+        return (int)rkmq->rkmq_msg_cnt;
 }
 
 /**
  * Returns the total number of bytes in the specified queue.
  */
 static RD_INLINE RD_UNUSED size_t rd_kafka_msgq_size (rd_kafka_msgq_t *rkmq) {
-	return (size_t)rd_atomic64_get(&rkmq->rkmq_msg_bytes);
+        return (size_t)rkmq->rkmq_msg_bytes;
 }
 
 
@@ -167,9 +202,9 @@ int rd_kafka_msg_new (rd_kafka_itopic_t *rkt, int32_t force_partition,
 		      void *msg_opaque);
 
 static RD_INLINE RD_UNUSED void rd_kafka_msgq_init (rd_kafka_msgq_t *rkmq) {
-	TAILQ_INIT(&rkmq->rkmq_msgs);
-	rd_atomic32_init(&rkmq->rkmq_msg_cnt, 0);
-	rd_atomic64_init(&rkmq->rkmq_msg_bytes, 0);
+        TAILQ_INIT(&rkmq->rkmq_msgs);
+        rkmq->rkmq_msg_cnt   = 0;
+        rkmq->rkmq_msg_bytes = 0;
 }
 
 /**
@@ -180,8 +215,8 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_init (rd_kafka_msgq_t *rkmq) {
 static RD_INLINE RD_UNUSED void rd_kafka_msgq_concat (rd_kafka_msgq_t *dst,
 						   rd_kafka_msgq_t *src) {
 	TAILQ_CONCAT(&dst->rkmq_msgs, &src->rkmq_msgs, rkm_link);
-	rd_atomic32_add(&dst->rkmq_msg_cnt, rd_atomic32_get(&src->rkmq_msg_cnt));
-	rd_atomic64_add(&dst->rkmq_msg_bytes, rd_atomic64_get(&src->rkmq_msg_bytes));
+        dst->rkmq_msg_cnt   += src->rkmq_msg_cnt;
+        dst->rkmq_msg_bytes += src->rkmq_msg_bytes;
 	rd_kafka_msgq_init(src);
 }
 
@@ -192,8 +227,8 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_concat (rd_kafka_msgq_t *dst,
 static RD_INLINE RD_UNUSED void rd_kafka_msgq_move (rd_kafka_msgq_t *dst,
 						 rd_kafka_msgq_t *src) {
 	TAILQ_MOVE(&dst->rkmq_msgs, &src->rkmq_msgs, rkm_link);
-	rd_atomic32_set(&dst->rkmq_msg_cnt, rd_atomic32_get(&src->rkmq_msg_cnt));
-	rd_atomic64_set(&dst->rkmq_msg_bytes, rd_atomic64_get(&src->rkmq_msg_bytes));
+        dst->rkmq_msg_cnt   = src->rkmq_msg_cnt;
+        dst->rkmq_msg_bytes = src->rkmq_msg_bytes;
 	rd_kafka_msgq_init(src);
 }
 
@@ -225,11 +260,11 @@ rd_kafka_msg_t *rd_kafka_msgq_deq (rd_kafka_msgq_t *rkmq,
 				   rd_kafka_msg_t *rkm,
 				   int do_count) {
 	if (likely(do_count)) {
-		rd_kafka_assert(NULL, rd_atomic32_get(&rkmq->rkmq_msg_cnt) > 0);
-		rd_kafka_assert(NULL, rd_atomic64_get(&rkmq->rkmq_msg_bytes) >= (int64_t)(rkm->rkm_len+rkm->rkm_key_len));
-		rd_atomic32_sub(&rkmq->rkmq_msg_cnt, 1);
-		rd_atomic64_sub(&rkmq->rkmq_msg_bytes,
-				rkm->rkm_len+rkm->rkm_key_len);
+		rd_kafka_assert(NULL, rkmq->rkmq_msg_cnt > 0);
+                rd_kafka_assert(NULL, rkmq->rkmq_msg_bytes >=
+                                (int64_t)(rkm->rkm_len+rkm->rkm_key_len));
+                rkmq->rkmq_msg_cnt--;
+                rkmq->rkmq_msg_bytes -= rkm->rkm_len+rkm->rkm_key_len;
 	}
 
 	TAILQ_REMOVE(&rkmq->rkmq_msgs, rkm, rkm_link);
@@ -247,24 +282,71 @@ rd_kafka_msg_t *rd_kafka_msgq_pop (rd_kafka_msgq_t *rkmq) {
 	return rkm;
 }
 
+
+/**
+ * @brief Message ordering comparator using the message sequence
+ *        number to order messages in ascending order (FIFO).
+ */
+static RD_INLINE
+int rd_kafka_msg_cmp_msgseq (const void *_a, const void *_b) {
+        const rd_kafka_msg_t *a = _a, *b = _b;
+
+        rd_dassert(a->rkm_u.producer.msgseq);
+
+        if (a->rkm_u.producer.msgseq > b->rkm_u.producer.msgseq)
+                return 1;
+        else if (a->rkm_u.producer.msgseq < b->rkm_u.producer.msgseq)
+                return -1;
+        else
+                return 0;
+}
+
+/**
+ * @brief Message ordering comparator using the message sequence
+ *        number to order messages in descending order (LIFO).
+ */
+static RD_INLINE
+int rd_kafka_msg_cmp_msgseq_lifo (const void *_a, const void *_b) {
+        const rd_kafka_msg_t *a = _a, *b = _b;
+
+        rd_dassert(a->rkm_u.producer.msgseq);
+
+        if (a->rkm_u.producer.msgseq < b->rkm_u.producer.msgseq)
+                return 1;
+        else if (a->rkm_u.producer.msgseq > b->rkm_u.producer.msgseq)
+                return -1;
+        else
+                return 0;
+}
+
+/**
+ * @brief Insert message at its sorted position using the msgseq.
+ * @remark This is an O(n) operation.
+ * @warning The message must have a msgseq set.
+ * @returns the message count of the queue after enqueuing the message.
+ */
+int rd_kafka_msgq_enq_sorted (const rd_kafka_itopic_t *rkt,
+                               rd_kafka_msgq_t *rkmq,
+                               rd_kafka_msg_t *rkm);
+
 /**
  * Insert message at head of message queue.
  */
 static RD_INLINE RD_UNUSED void rd_kafka_msgq_insert (rd_kafka_msgq_t *rkmq,
 						   rd_kafka_msg_t *rkm) {
 	TAILQ_INSERT_HEAD(&rkmq->rkmq_msgs, rkm, rkm_link);
-	rd_atomic32_add(&rkmq->rkmq_msg_cnt, 1);
-	rd_atomic64_add(&rkmq->rkmq_msg_bytes, rkm->rkm_len+rkm->rkm_key_len);
+        rkmq->rkmq_msg_cnt++;
+        rkmq->rkmq_msg_bytes += rkm->rkm_len+rkm->rkm_key_len;
 }
 
 /**
  * Append message to tail of message queue.
  */
-static RD_INLINE RD_UNUSED void rd_kafka_msgq_enq (rd_kafka_msgq_t *rkmq,
-						rd_kafka_msg_t *rkm) {
-	TAILQ_INSERT_TAIL(&rkmq->rkmq_msgs, rkm, rkm_link);
-	rd_atomic32_add(&rkmq->rkmq_msg_cnt, 1);
-	rd_atomic64_add(&rkmq->rkmq_msg_bytes, rkm->rkm_len+rkm->rkm_key_len);
+static RD_INLINE RD_UNUSED int rd_kafka_msgq_enq (rd_kafka_msgq_t *rkmq,
+                                                rd_kafka_msg_t *rkm) {
+        TAILQ_INSERT_TAIL(&rkmq->rkmq_msgs, rkm, rkm_link);
+        rkmq->rkmq_msg_bytes += rkm->rkm_len+rkm->rkm_key_len;
+        return (int)++rkmq->rkmq_msg_cnt;
 }
 
 
@@ -278,6 +360,10 @@ int rd_kafka_msgq_age_scan (rd_kafka_msgq_t *rkmq,
 			    rd_kafka_msgq_t *timedout,
 			    rd_ts_t now);
 
+rd_kafka_msg_t *rd_kafka_msgq_find_pos (const rd_kafka_msgq_t *rkmq,
+                                        const rd_kafka_msg_t *rkm,
+                                        int (*cmp) (const void *,
+                                                    const void *));
 
 int rd_kafka_msg_partitioner (rd_kafka_itopic_t *rkt, rd_kafka_msg_t *rkm,
                               int do_lock);
@@ -288,3 +374,8 @@ rd_kafka_message_t *rd_kafka_message_get_from_rkm (struct rd_kafka_op_s *rko,
                                                    rd_kafka_msg_t *rkm);
 rd_kafka_message_t *rd_kafka_message_new (void);
 
+void rd_kafka_msgq_dump (FILE *fp, const char *what, rd_kafka_msgq_t *rkmq);
+
+int unittest_msg (void);
+
+#endif /* _RDKAFKA_MSG_H_ */

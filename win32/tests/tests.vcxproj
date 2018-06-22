@@ -155,6 +155,15 @@
     <ClCompile Include="..\..\tests\0068-produce_timeout.c" />
     <ClCompile Include="..\..\tests\0069-consumer_add_parts.c" />
     <ClCompile Include="..\..\tests\0070-null_empty.cpp" />
+    <ClCompile Include="..\..\tests\0072-headers_ut.c" />
+    <ClCompile Include="..\..\tests\0073-headers.c" />
+    <ClCompile Include="..\..\tests\0074-producev.c" />
+    <ClCompile Include="..\..\tests\0075-retry.c" />
+    <ClCompile Include="..\..\tests\0076-produce_retry.c" />
+    <ClCompile Include="..\..\tests\0077-compaction.c" />
+    <ClCompile Include="..\..\tests\0078-c_from_cpp.cpp" />
+    <ClCompile Include="..\..\tests\0079-fork.c" />
+    <ClCompile Include="..\..\tests\0081-fetch_max_bytes.cpp" />
     <ClCompile Include="..\..\tests\8000-idle.cpp" />
     <ClCompile Include="..\..\tests\test.c" />
     <ClCompile Include="..\..\tests\testcpp.cpp" />

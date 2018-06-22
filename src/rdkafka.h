@@ -41,7 +41,8 @@
 
 
 /* @cond NO_DOC */
-#pragma once
+#ifndef _RDKAFKA_H_
+#define _RDKAFKA_H_
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -108,9 +109,19 @@ typedef SSIZE_T ssize_t;
                         TYPE2 __t2 RD_UNUSED = (ARG2);  \
                 }                                       \
                 RET; })
+
+#define _LRK_TYPECHECK3(RET,TYPE,ARG,TYPE2,ARG2,TYPE3,ARG3) \
+        ({                                              \
+                if (0) {                                \
+                        TYPE __t RD_UNUSED = (ARG);     \
+                        TYPE2 __t2 RD_UNUSED = (ARG2);  \
+                        TYPE3 __t3 RD_UNUSED = (ARG3);  \
+                }                                       \
+                RET; })
 #else
 #define _LRK_TYPECHECK(RET,TYPE,ARG)  (RET)
 #define _LRK_TYPECHECK2(RET,TYPE,ARG,TYPE2,ARG2) (RET)
+#define _LRK_TYPECHECK3(RET,TYPE,ARG,TYPE2,ARG2,TYPE3,ARG3) (RET)
 #endif
 
 /* @endcond */
@@ -137,7 +148,7 @@ typedef SSIZE_T ssize_t;
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use rd_kafka_version()
  */
-#define RD_KAFKA_VERSION  0x000b01ff
+#define RD_KAFKA_VERSION  0x000b04ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -212,7 +223,7 @@ const char *rd_kafka_get_debug_contexts(void);
  *             Use rd_kafka_get_debug_contexts() instead.
  */
 #define RD_KAFKA_DEBUG_CONTEXTS \
-	"all,generic,broker,topic,metadata,queue,msg,protocol,cgrp,security,fetch,feature"
+        "all,generic,broker,topic,metadata,feature,queue,msg,protocol,cgrp,security,fetch,interceptor,plugin,consumer"
 
 
 /* @cond NO_DOC */
@@ -324,6 +335,14 @@ typedef enum {
         RD_KAFKA_RESP_ERR__KEY_DESERIALIZATION = -160,
         /** Value deserialization error */
         RD_KAFKA_RESP_ERR__VALUE_DESERIALIZATION = -159,
+        /** Partial response */
+        RD_KAFKA_RESP_ERR__PARTIAL = -158,
+        /** Modification attempted on read-only object */
+        RD_KAFKA_RESP_ERR__READ_ONLY = -157,
+        /** No such entry / item not found */
+        RD_KAFKA_RESP_ERR__NOENT = -156,
+        /** Read underflow */
+        RD_KAFKA_RESP_ERR__UNDERFLOW = -155,
 
 	/** End internal error codes */
 	RD_KAFKA_RESP_ERR__END = -100,
@@ -783,6 +802,9 @@ typedef enum rd_kafka_vtype_t {
         RD_KAFKA_VTYPE_OPAQUE,    /**< (void *) Application opaque */
         RD_KAFKA_VTYPE_MSGFLAGS,  /**< (int) RD_KAFKA_MSG_F_.. flags */
         RD_KAFKA_VTYPE_TIMESTAMP, /**< (int64_t) Milliseconds since epoch UTC */
+        RD_KAFKA_VTYPE_HEADER,    /**< (const char *, const void *, ssize_t)
+                                   *   Message Header */
+        RD_KAFKA_VTYPE_HEADERS,   /**< (rd_kafka_headers_t *) Headers list */
 } rd_kafka_vtype_t;
 
 
@@ -827,7 +849,8 @@ typedef enum rd_kafka_vtype_t {
         _LRK_TYPECHECK2(RD_KAFKA_VTYPE_KEY, const void *, KEY, size_t, LEN), \
         (void *)KEY, (size_t)LEN
 /*!
- * Opaque pointer (void *)
+ * Message opaque pointer (void *)
+ * Same as \c produce(.., msg_opaque), and \c rkmessage->_private .
  */
 #define RD_KAFKA_V_OPAQUE(opaque)                                 \
         _LRK_TYPECHECK(RD_KAFKA_VTYPE_OPAQUE, void *, opaque),    \
@@ -845,8 +868,162 @@ typedef enum rd_kafka_vtype_t {
 #define RD_KAFKA_V_TIMESTAMP(timestamp)                                 \
         _LRK_TYPECHECK(RD_KAFKA_VTYPE_TIMESTAMP, int64_t, timestamp),   \
         (int64_t)timestamp
+/*!
+ * Add Message Header (const char *NAME, const void *VALUE, ssize_t LEN).
+ * @sa rd_kafka_header_add()
+ * @remark RD_KAFKA_V_HEADER() and RD_KAFKA_V_HEADERS() MUST NOT be mixed
+ *         in the same call to producev().
+ */
+#define RD_KAFKA_V_HEADER(NAME,VALUE,LEN)                               \
+        _LRK_TYPECHECK3(RD_KAFKA_VTYPE_HEADER, const char *, NAME,      \
+                        const void *, VALUE, ssize_t, LEN),             \
+                (const char *)NAME, (const void *)VALUE, (ssize_t)LEN
+
+/*!
+ * Message Headers list (rd_kafka_headers_t *).
+ * The message object will assume ownership of the headers (unless producev()
+ * fails).
+ * Any existing headers will be replaced.
+ * @sa rd_kafka_message_set_headers()
+ * @remark RD_KAFKA_V_HEADER() and RD_KAFKA_V_HEADERS() MUST NOT be mixed
+ *         in the same call to producev().
+ */
+#define RD_KAFKA_V_HEADERS(HDRS)                                        \
+        _LRK_TYPECHECK(RD_KAFKA_VTYPE_HEADERS, rd_kafka_headers_t *, HDRS), \
+                (rd_kafka_headers_t *)HDRS
+
 
 /**@}*/
+
+
+/**
+ * @name Message headers
+ * @{
+ *
+ * @brief Message headers consist of a list of (string key, binary value) pairs.
+ *        Duplicate keys are supported and the order in which keys were
+ *        added are retained.
+ *
+ *        Header values are considered binary and may have three types of
+ *        value:
+ *          - proper value with size > 0 and a valid pointer
+ *          - empty value with size = 0 and any non-NULL pointer
+ *          - null value with size = 0 and a NULL pointer
+ *
+ *        Headers require Apache Kafka broker version v0.11.0.0 or later.
+ *
+ *        Header operations are O(n).
+ */
+
+typedef struct rd_kafka_headers_s rd_kafka_headers_t;
+
+/**
+ * @brief Create a new headers list.
+ *
+ * @param initial_count Preallocate space for this number of headers.
+ *                      Any number of headers may be added, updated and
+ *                      removed regardless of the initial count.
+ */
+RD_EXPORT rd_kafka_headers_t *rd_kafka_headers_new (size_t initial_count);
+
+/**
+ * @brief Destroy the headers list. The object and any returned value pointers
+ *        are not usable after this call.
+ */
+RD_EXPORT void rd_kafka_headers_destroy (rd_kafka_headers_t *hdrs);
+
+/**
+ * @brief Make a copy of headers list \p src.
+ */
+RD_EXPORT rd_kafka_headers_t *
+rd_kafka_headers_copy (const rd_kafka_headers_t *src);
+
+/**
+ * @brief Add header with name \p name and value \p val (copied) of size
+ *        \p size (not including null-terminator).
+ *
+ * @param name       Header name.
+ * @param name_size  Header name size (not including the null-terminator).
+ *                   If -1 the \p name length is automatically acquired using
+ *                   strlen().
+ * @param value      Pointer to header value, or NULL (set size to 0 or -1).
+ * @param value_size Size of header value. If -1 the \p value is assumed to be a
+ *                   null-terminated string and the length is automatically
+ *                   acquired using strlen().
+ *
+ * @returns RD_KAFKA_RESP_ERR__READ_ONLY if the headers are read-only,
+ *          else RD_KAFKA_RESP_ERR_NO_ERROR.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_header_add (rd_kafka_headers_t *hdrs,
+                     const char *name, ssize_t name_size,
+                     const void *value, ssize_t value_size);
+
+/**
+ * @brief Remove all headers for the given key (if any).
+ *
+ * @returns RD_KAFKA_RESP_ERR__READ_ONLY if the headers are read-only,
+ *          RD_KAFKA_RESP_ERR__NOENT if no matching headers were found,
+ *          else RD_KAFKA_RESP_ERR_NO_ERROR if headers were removed.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_header_remove (rd_kafka_headers_t *hdrs, const char *name);
+
+
+/**
+ * @brief Find last header in list \p hdrs matching \p name.
+ *
+ * @param name   Header to find (last match).
+ * @param valuep (out) Set to a (null-terminated) const pointer to the value
+ *               (may be NULL).
+ * @param sizep  (out) Set to the value's size (not including null-terminator).
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if an entry was found, else
+ *          RD_KAFKA_RESP_ERR__NOENT.
+ *
+ * @remark The returned pointer in \p valuep includes a trailing null-terminator
+ *         that is not accounted for in \p sizep.
+ * @remark The returned pointer is only valid as long as the headers list and
+ *         the header item is valid.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_header_get_last (const rd_kafka_headers_t *hdrs,
+                          const char *name, const void **valuep, size_t *sizep);
+
+/**
+ * @brief Iterator for headers matching \p name.
+ *
+ *        Same semantics as rd_kafka_header_get_last()
+ *
+ * @param hdrs   Headers to iterate.
+ * @param idx    Iterator index, start at 0 and increment by one for each call
+ *               as long as RD_KAFKA_RESP_ERR_NO_ERROR is returned.
+ * @param name   Header name to match.
+ * @param valuep (out) Set to a (null-terminated) const pointer to the value
+ *               (may be NULL).
+ * @param sizep  (out) Set to the value's size (not including null-terminator).
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_header_get (const rd_kafka_headers_t *hdrs, size_t idx,
+                     const char *name, const void **valuep, size_t *sizep);
+
+
+/**
+ * @brief Iterator for all headers.
+ *
+ *        Same semantics as rd_kafka_header_get()
+ *
+ * @sa rd_kafka_header_get()
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_header_get_all (const rd_kafka_headers_t *hdrs, size_t idx,
+                         const char **namep,
+                         const void **valuep, size_t *sizep);
+
+
+
+/**@}*/
+
 
 
 /**
@@ -959,6 +1136,66 @@ int64_t rd_kafka_message_timestamp (const rd_kafka_message_t *rkmessage,
  */
 RD_EXPORT
 int64_t rd_kafka_message_latency (const rd_kafka_message_t *rkmessage);
+
+
+/**
+ * @brief Get the message header list.
+ *
+ * The returned pointer in \p *hdrsp is associated with the \p rkmessage and
+ * must not be used after destruction of the message object or the header
+ * list is replaced with rd_kafka_message_set_headers().
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if headers were returned,
+ *          RD_KAFKA_RESP_ERR__NOENT if the message has no headers,
+ *          or another error code if the headers could not be parsed.
+ *
+ * @remark Headers require broker version 0.11.0.0 or later.
+ *
+ * @remark As an optimization the raw protocol headers are parsed on
+ *         the first call to this function.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_message_headers (const rd_kafka_message_t *rkmessage,
+                          rd_kafka_headers_t **hdrsp);
+
+/**
+ * @brief Get the message header list and detach the list from the message
+ *        making the application the owner of the headers.
+ *        The application must eventually destroy the headers using
+ *        rd_kafka_headers_destroy().
+ *        The message's headers will be set to NULL.
+ *
+ *        Otherwise same semantics as rd_kafka_message_headers()
+ *
+ * @sa rd_kafka_message_headers
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_message_detach_headers (rd_kafka_message_t *rkmessage,
+                                 rd_kafka_headers_t **hdrsp);
+
+
+/**
+ * @brief Replace the message's current headers with a new list.
+ *
+ * @param hdrs New header list. The message object assumes ownership of
+ *             the list, the list will be destroyed automatically with
+ *             the message object.
+ *             The new headers list may be updated until the message object
+ *             is passed or returned to librdkafka.
+ *
+ * @remark The existing headers object, if any, will be destroyed.
+ */
+RD_EXPORT
+void rd_kafka_message_set_headers (rd_kafka_message_t *rkmessage,
+                                   rd_kafka_headers_t *hdrs);
+
+
+/**
+ * @brief Returns the number of header key/value pairs
+ *
+ * @param hdrs   Headers to count
+ */
+RD_EXPORT size_t rd_kafka_header_cnt (const rd_kafka_headers_t *hdrs);
 
 
 /**@}*/
@@ -1501,6 +1738,13 @@ RD_EXPORT
 rd_kafka_topic_conf_t *rd_kafka_topic_conf_dup(const rd_kafka_topic_conf_t
 						*conf);
 
+/**
+ * @brief Creates a copy/duplicate of \p rk 's default topic configuration
+ *        object.
+ */
+RD_EXPORT
+rd_kafka_topic_conf_t *rd_kafka_default_topic_conf_dup (rd_kafka_t *rk);
+
 
 /**
  * @brief Destroys a topic conf object.
@@ -1555,6 +1799,39 @@ rd_kafka_topic_conf_set_partitioner_cb (rd_kafka_topic_conf_t *topic_conf,
 						int32_t partition_cnt,
 						void *rkt_opaque,
 						void *msg_opaque));
+
+
+/**
+ * @brief \b Producer: Set message queueing order comparator callback.
+ *
+ * The callback may be called in any thread at any time,
+ * it may be called multiple times for the same message.
+ *
+ * Ordering comparator function constraints:
+ *   - MUST be stable sort (same input gives same output).
+ *   - MUST NOT call any rd_kafka_*() functions.
+ *   - MUST NOT block or execute for prolonged periods of time.
+ *
+ * The comparator shall compare the two messages and return:
+ *  - < 0 if message \p a should be inserted before message \p b.
+ *  - >=0 if message \p a should be inserted after message \p b.
+ *
+ * @remark Insert sorting will be used to enqueue the message in the
+ *         correct queue position, this comes at a cost of O(n).
+ *
+ * @remark If `queuing.strategy=fifo` new messages are enqueued to the
+ *         tail of the queue regardless of msg_order_cmp, but retried messages
+ *         are still affected by msg_order_cmp.
+ *
+ * @warning THIS IS AN EXPERIMENTAL API, SUBJECT TO CHANGE OR REMOVAL,
+ *          DO NOT USE IN PRODUCTION.
+ */
+RD_EXPORT void
+rd_kafka_topic_conf_set_msg_order_cmp (rd_kafka_topic_conf_t *topic_conf,
+                                       int (*msg_order_cmp) (
+                                               const rd_kafka_message_t *a,
+                                               const rd_kafka_message_t *b));
+
 
 /**
  * @brief Check if partition is available (has a leader broker).
@@ -1617,6 +1894,38 @@ int32_t rd_kafka_msg_partitioner_consistent_random (const rd_kafka_topic_t *rkt,
            const void *key, size_t keylen,
            int32_t partition_cnt,
            void *opaque, void *msg_opaque);
+
+
+/**
+ * @brief Murmur2 partitioner (Java compatible).
+ *
+ * Uses consistent hashing to map identical keys onto identical partitions
+ * using Java-compatible Murmur2 hashing.
+ *
+ * @returns a partition between 0 and \p partition_cnt - 1.
+ */
+RD_EXPORT
+int32_t rd_kafka_msg_partitioner_murmur2 (const rd_kafka_topic_t *rkt,
+                                          const void *key, size_t keylen,
+                                          int32_t partition_cnt,
+                                          void *rkt_opaque,
+                                          void *msg_opaque);
+
+/**
+ * @brief Consistent-Random Murmur2 partitioner (Java compatible).
+ *
+ * Uses consistent hashing to map identical keys onto identical partitions
+ * using Java-compatible Murmur2 hashing.
+ * Messages without keys will be assigned via the random partitioner.
+ *
+ * @returns a partition between 0 and \p partition_cnt - 1.
+ */
+RD_EXPORT
+int32_t rd_kafka_msg_partitioner_murmur2_random (const rd_kafka_topic_t *rkt,
+                                                 const void *key, size_t keylen,
+                                                 int32_t partition_cnt,
+                                                 void *rkt_opaque,
+                                                 void *msg_opaque);
 
 
 /**@}*/
@@ -1906,8 +2215,14 @@ rd_kafka_get_watermark_offsets (rd_kafka_t *rk,
  * @remark Duplicate Topic+Partitions are not supported.
  * @remark Per-partition errors may be returned in \c rd_kafka_topic_partition_t.err
  *
- * @returns an error code for general errors, else RD_KAFKA_RESP_ERR_NO_ERROR
- *          in which case per-partition errors might be set.
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if offsets were be queried (do note
+ *          that per-partition errors might be set),
+ *          RD_KAFKA_RESP_ERR__TIMED_OUT if not all offsets could be fetched
+ *          within \p timeout_ms,
+ *          RD_KAFKA_RESP_ERR__INVALID_ARG if the \p offsets list is empty,
+ *          RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION if all partitions are unknown,
+ *          RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE if unable to query leaders
+ *          for the given partitions.
  */
 RD_EXPORT rd_kafka_resp_err_t
 rd_kafka_offsets_for_times (rd_kafka_t *rk,
@@ -2357,7 +2672,7 @@ rd_kafka_resp_err_t rd_kafka_offset_store(rd_kafka_topic_t *rkt,
 
 
 /**
- * @brief Store offsets for one or more partitions.
+ * @brief Store offsets for next auto-commit for one or more partitions.
  *
  * The offset will be committed (written) to the offset store according
  * to \c `auto.commit.interval.ms` or manual offset-less commit().
@@ -2367,8 +2682,10 @@ rd_kafka_resp_err_t rd_kafka_offset_store(rd_kafka_topic_t *rkt,
  *
  * @remark \c `enable.auto.offset.store` must be set to "false" when using this API.
  *
- * @returns RD_KAFKA_RESP_ERR_NO_ERROR on success or an error code if
- *          none of the offsets could be stored.
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR on success, or
+ *          RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION if none of the
+ *          offsets could be stored, or
+ *          RD_KAFKA_RESP_ERR__INVALID_ARG if \c enable.auto.offset.store is true.
  */
 RD_EXPORT rd_kafka_resp_err_t
 rd_kafka_offsets_store(rd_kafka_t *rk,
@@ -2627,8 +2944,9 @@ rd_kafka_position (rd_kafka_t *rk,
 				  *            Failure to do so will result
 				  *            in indefinately blocking on
 				  *            the produce() call when the
-				  *            message queue is full.
-				  */
+				  *            message queue is full. */
+#define RD_KAFKA_MSG_F_PARTITION 0x8 /**< produce_batch() will honor
+                                     * per-message partition. */
 
 
 
@@ -2662,6 +2980,9 @@ rd_kafka_position (rd_kafka_t *rk,
  *    RD_KAFKA_MSG_F_COPY - the \p payload data will be copied and the 
  *                          \p payload pointer will not be used by rdkafka
  *                          after the call returns.
+ *    RD_KAFKA_MSG_F_PARTITION - produce_batch() will honour per-message
+ *                               partition, either set manually or by the
+ *                               configured partitioner.
  *
  *    .._F_FREE and .._F_COPY are mutually exclusive.
  *
@@ -2712,6 +3033,8 @@ int rd_kafka_produce(rd_kafka_topic_t *rkt, int32_t partition,
  * tag tuples which must be terminated with a single \c RD_KAFKA_V_END.
  *
  * @returns \c RD_KAFKA_RESP_ERR_NO_ERROR on success, else an error code.
+ *          \c RD_KAFKA_RESP_ERR__CONFLICT is returned if _V_HEADER and
+ *          _V_HEADERS are mixed.
  *
  * @sa rd_kafka_produce, RD_KAFKA_V_END
  */
@@ -2739,6 +3062,9 @@ rd_kafka_resp_err_t rd_kafka_producev (rd_kafka_t *rk, ...);
  *                   return value != \p message_cnt.
  *
  * @returns the number of messages succesfully enqueued for producing.
+ *
+ * @remark This interface does NOT support setting message headers on
+ *         the provided \p rkmessages.
  */
 RD_EXPORT
 int rd_kafka_produce_batch(rd_kafka_topic_t *rkt, int32_t partition,
@@ -2917,10 +3243,21 @@ struct rd_kafka_group_list {
  * \p timeout_ms is the (approximate) maximum time to wait for response
  * from brokers and must be a positive value.
  *
- * @returns \p RD_KAFKA_RESP_ERR__NO_ERROR on success and \p grplistp is
+ * @returns \c RD_KAFKA_RESP_ERR__NO_ERROR on success and \p grplistp is
  *           updated to point to a newly allocated list of groups.
- *           Else returns an error code on failure and \p grplistp remains
- *           untouched.
+ *           \c RD_KAFKA_RESP_ERR__PARTIAL if not all brokers responded
+ *           in time but at least one group is returned in  \p grplistlp.
+ *           \c RD_KAFKA_RESP_ERR__TIMED_OUT if no groups were returned in the
+ *           given timeframe but not all brokers have yet responded, or
+ *           if the list of brokers in the cluster could not be obtained within
+ *           the given timeframe.
+ *           \c RD_KAFKA_RESP_ERR__TRANSPORT if no brokers were found.
+ *           Other error codes may also be returned from the request layer.
+ *
+ *           The \p grplistp remains untouched if any error code is returned,
+ *           with the exception of RD_KAFKA_RESP_ERR__PARTIAL which behaves
+ *           as RD_KAFKA_RESP_ERR__NO_ERROR (success) but with an incomplete
+ *           group list.
  *
  * @sa Use rd_kafka_group_list_destroy() to release list memory.
  */
@@ -3406,9 +3743,9 @@ typedef rd_kafka_resp_err_t
  * interceptor chains.
  *
  * @remark Contrary to the Java client the librdkafka interceptor interface
- *         does not support message modification. Message mutability is
- *         discouraged in the Java client and the combination of
- *         serializers and headers cover most use-cases.
+ *         does not support message key and value modification.
+ *         Message mutability is discouraged in the Java client and the
+ *         combination of serializers and headers cover most use-cases.
  *
  * @remark Interceptors are NOT copied to the new configuration on
  *         rd_kafka_conf_dup() since it would be hard for interceptors to
@@ -3629,6 +3966,40 @@ typedef rd_kafka_resp_err_t
         rd_kafka_resp_err_t err, void *ic_opaque);
 
 
+/**
+ * @brief on_request_sent() is called when a request has been fully written
+ *        to a broker TCP connections socket.
+ *
+ * @param rk The client instance.
+ * @param sockfd Socket file descriptor.
+ * @param brokername Broker request is being sent to.
+ * @param brokerid Broker request is being sent to.
+ * @param ApiKey Kafka protocol request type.
+ * @param ApiVersion Kafka protocol request type version.
+ * @param Corrid Kafka protocol request correlation id.
+ * @param size Size of request.
+ * @param ic_opaque The interceptor's opaque pointer specified in ..add..().
+ *
+ * @warning The on_request_sent() interceptor is called from internal
+ *          librdkafka broker threads. An on_request_sent() interceptor MUST NOT
+ *          call any librdkafka API's associated with the \p rk, or perform
+ *          any blocking or prolonged work.
+ *
+ * @returns an error code on failure, the error is logged but otherwise ignored.
+ */
+typedef rd_kafka_resp_err_t
+(rd_kafka_interceptor_f_on_request_sent_t) (
+        rd_kafka_t *rk,
+        int sockfd,
+        const char *brokername,
+        int32_t brokerid,
+        int16_t ApiKey,
+        int16_t ApiVersion,
+        int32_t CorrId,
+        size_t  size,
+        void *ic_opaque);
+
+
 
 /**
  * @brief Append an on_conf_set() interceptor.
@@ -3810,6 +4181,25 @@ rd_kafka_interceptor_add_on_commit (
         void *ic_opaque);
 
 
+/**
+ * @brief Append an on_request_sent() interceptor.
+ *
+ * @param rk Client instance.
+ * @param ic_name Interceptor name, used in logging.
+ * @param on_request_sent() Function pointer.
+ * @param ic_opaque Opaque value that will be passed to the function.
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR on success or RD_KAFKA_RESP_ERR__CONFLICT
+ *          if an existing intercepted with the same \p ic_name and function
+ *          has already been added to \p conf.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_interceptor_add_on_request_sent (
+        rd_kafka_t *rk, const char *ic_name,
+        rd_kafka_interceptor_f_on_request_sent_t *on_request_sent,
+        void *ic_opaque);
+
+
 
 
 /**@}*/
@@ -3818,3 +4208,4 @@ rd_kafka_interceptor_add_on_commit (
 #ifdef __cplusplus
 }
 #endif
+#endif /* _RDKAFKA_H_ */

@@ -26,6 +26,42 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#include "test.h"
+#include "rdkafka.h"
+
+/**
+ * @brief Simple producev() verification
+ */
+
+/**
+ * @brief Verify #1478: The internal shared rkt reference was not destroyed
+ *        when producev() failed.
+ */
+
+static void do_test_srkt_leak (void) {
+        rd_kafka_conf_t *conf;
+        char buf[2000];
+        rd_kafka_t *rk;
+        rd_kafka_resp_err_t err;
+
+        conf = rd_kafka_conf_new();
+        test_conf_set(conf, "message.max.bytes", "1000");
+
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+
+        err = rd_kafka_producev(rk,
+                                RD_KAFKA_V_TOPIC("test"),
+                                RD_KAFKA_V_VALUE(buf, sizeof(buf)),
+                                RD_KAFKA_V_END);
+        TEST_ASSERT(err == RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE,
+                    "expected MSG_SIZE_TOO_LARGE, not %s",
+                    rd_kafka_err2str(err));
+
+        rd_kafka_destroy(rk);
+}
 
 
+int main_0074_producev (int argc, char **argv) {
+        do_test_srkt_leak();
+        return 0;
+}

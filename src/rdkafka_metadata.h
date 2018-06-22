@@ -26,13 +26,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#ifndef _RDKAFKA_METADATA_H_
+#define _RDKAFKA_METADATA_H_
 
 #include "rdavl.h"
 
-struct rd_kafka_metadata *
+rd_kafka_resp_err_t
 rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
-                         rd_kafka_buf_t *request, rd_kafka_buf_t *rkbuf);
+                         rd_kafka_buf_t *request, rd_kafka_buf_t *rkbuf,
+                         struct rd_kafka_metadata **mdp);
 
 struct rd_kafka_metadata *
 rd_kafka_metadata_copy (const struct rd_kafka_metadata *md, size_t size);
@@ -155,3 +157,4 @@ int  rd_kafka_metadata_cache_wait_change (rd_kafka_t *rk, int timeout_ms);
 void rd_kafka_metadata_cache_dump (FILE *fp, rd_kafka_t *rk);
 
 /**@}*/
+#endif /* _RDKAFKA_METADATA_H_ */

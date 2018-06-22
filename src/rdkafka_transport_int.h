@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_TRANSPORT_INT_H_
+#define _RDKAFKA_TRANSPORT_INT_H_
 
 /* This header file is to be used by .c files needing access to the
  * rd_kafka_transport_t struct internals. */
@@ -35,6 +36,7 @@
 #if WITH_SSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/pkcs12.h>
 #endif
 
 struct rd_kafka_transport_s {	
@@ -82,3 +84,4 @@ struct rd_kafka_transport_s {
         size_t rktrans_sndbuf_size;    /**< Socket send buffer size */
 };
 
+#endif /* _RDKAFKA_TRANSPORT_INT_H_ */

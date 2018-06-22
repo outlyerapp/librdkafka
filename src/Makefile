@@ -35,11 +35,12 @@ SRCS=		rdkafka.c rdkafka_broker.c rdkafka_msg.c rdkafka_topic.c \
 		rdkafka_partition.c rdkafka_subscription.c \
 		rdkafka_assignor.c rdkafka_range_assignor.c \
 		rdkafka_roundrobin_assignor.c rdkafka_feature.c \
-		rdcrc32.c crc32c.c rdaddr.c rdrand.c rdlist.c tinycthread.c \
+		rdcrc32.c crc32c.c rdmurmur2.c rdaddr.c rdrand.c rdlist.c tinycthread.c \
 		rdlog.c rdstring.c rdkafka_event.c rdkafka_metadata.c \
 		rdregex.c rdports.c rdkafka_metadata_cache.c rdavl.c \
 		rdkafka_sasl.c rdkafka_sasl_plain.c rdkafka_interceptor.c \
 		rdkafka_msgset_writer.c rdkafka_msgset_reader.c \
+		rdkafka_header.c \
 		rdvarint.c rdbuf.c rdunittest.c \
 		$(SRCS_y)
 
@@ -72,10 +73,10 @@ $(SRCS_LZ4:.c=.o): CFLAGS:=$(CFLAGS) -O3
 ifeq ($(WITH_LDS),y)
 # Enable linker script if supported by platform
 LIB_LDFLAGS+= $(LDFLAG_LINKERSCRIPT)$(LIBNAME).lds
-endif
 
 $(LIBNAME).lds: $(HDRS)
 	@(printf "$(MKL_YELLOW)Generating linker script $@ from $(HDRS)$(MKL_CLR_RESET)\n" ; \
 	  cat $(HDRS) | ../lds-gen.py > $@)
+endif
 
 -include $(DEPS)
